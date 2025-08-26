@@ -4,3 +4,4 @@ haystack-ai
 sentence-transformers
 transformers
 ollama-haystack
+requests
