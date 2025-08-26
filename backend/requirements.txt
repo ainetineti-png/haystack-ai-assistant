@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+haystack-ai
+sentence-transformers
+transformers
+ollama-haystack
