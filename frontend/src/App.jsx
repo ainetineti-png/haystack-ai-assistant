@@ -1,61 +1,174 @@
-import React, { useState } from "react";
+import React, { useState, useRef, useEffect } from "react";
+import "./App.css";
 
 function App() {
   const [question, setQuestion] = useState("");
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
+  const chatEndRef = useRef(null);
+
+  const scrollToBottom = () => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [history]);
 
   const askQuestion = async () => {
     if (!question.trim()) return;
+    
+    const userMessage = { type: "user", content: question };
+    setHistory(prev => [...prev, userMessage]);
     setLoading(true);
-    const res = await fetch("http://localhost:8001/ask", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
-    });
-    const data = await res.json();
-    setHistory([
-      ...history,
-      {
-        question,
-        answer: data.answer,
-        context: data.context,
-      },
-    ]);
     setQuestion("");
+
+    try {
+      const res = await fetch("http://localhost:8001/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ question }),
+      });
+      const data = await res.json();
+      
+      const aiMessage = {
+        type: "ai",
+        content: data.answer,
+        context: data.context,
+        documentsFound: data.documents_found
+      };
+      
+      setHistory(prev => [...prev, aiMessage]);
+    } catch (error) {
+      const errorMessage = {
+        type: "error",
+        content: "Sorry, I couldn't process your question. Please try again."
+      };
+      setHistory(prev => [...prev, errorMessage]);
+    }
+    
     setLoading(false);
   };
 
+  const handleKeyPress = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      askQuestion();
+    }
+  };
+
   return (
-    <div style={{ maxWidth: 600, margin: "40px auto", fontFamily: "sans-serif" }}>
-      <h2>AI Tutor Chat (RAG)</h2>
-      <div style={{ marginBottom: 20 }}>
-        <input
-          value={question}
-          onChange={e => setQuestion(e.target.value)}
-          onKeyDown={e => e.key === "Enter" && askQuestion()}
-          placeholder="Ask a question..."
-          style={{ width: "80%", padding: 8 }}
-        />
-        <button onClick={askQuestion} disabled={loading} style={{ marginLeft: 8 }}>
-          {loading ? "Thinking..." : "Ask"}
-        </button>
+    <div className="app">
+      {/* Header */}
+      <div className="header">
+        <div className="header-content">
+          <h1>🤖 AI Knowledge Assistant</h1>
+          <p>Ask me anything about your documents</p>
+        </div>
       </div>
-      <div>
-        {history.map((item, idx) => (
-          <div key={idx} style={{ marginBottom: 24, padding: 16, border: "1px solid #eee", borderRadius: 8 }}>
-            <div><strong>You:</strong> {item.question}</div>
-            <div style={{ marginTop: 8 }}><strong>AI:</strong> {item.answer}</div>
-            <div style={{ marginTop: 8, fontSize: "0.95em", color: "#555" }}>
-              <strong>Context:</strong>
-              <ul>
-                {item.context.map((ctx, i) => (
-                  <li key={i}>{ctx}</li>
-                ))}
-              </ul>
+
+      {/* Chat Container */}
+      <div className="chat-container">
+        <div className="chat-messages">
+          {history.length === 0 && (
+            <div className="welcome-message">
+              <div className="welcome-icon">💡</div>
+              <h2>Welcome to your AI Assistant!</h2>
+              <p>I can help you find information from your knowledge base. Try asking questions like:</p>
+              <div className="example-questions">
+                <span className="example">• "What is Python?"</span>
+                <span className="example">• "Tell me about FastAPI features"</span>
+                <span className="example">• "How does modularity work?"</span>
+              </div>
             </div>
-          </div>
-        ))}
+          )}
+
+          {history.map((item, idx) => (
+            <div key={idx} className={`message ${item.type}`}>
+              {item.type === "user" && (
+                <div className="message-content">
+                  <div className="message-avatar user-avatar">👤</div>
+                  <div className="message-text user-text">{item.content}</div>
+                </div>
+              )}
+              
+              {item.type === "ai" && (
+                <div className="message-content">
+                  <div className="message-avatar ai-avatar">🤖</div>
+                  <div className="message-text ai-text">
+                    <div className="ai-response">{item.content}</div>
+                    {item.context && item.context.length > 0 && (
+                      <div className="context-section">
+                        <div className="context-header">
+                          📚 Sources ({item.documentsFound} document{item.documentsFound !== 1 ? 's' : ''} found):
+                        </div>
+                        <div className="context-list">
+                          {item.context.map((ctx, i) => (
+                            <div key={i} className="context-item">
+                              <div className="context-filename">
+                                📄 {ctx.split(':')[0]}
+                              </div>
+                              <div className="context-preview">
+                                {ctx.substring(ctx.indexOf(':') + 1).trim()}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {item.type === "error" && (
+                <div className="message-content">
+                  <div className="message-avatar error-avatar">❌</div>
+                  <div className="message-text error-text">{item.content}</div>
+                </div>
+              )}
+            </div>
+          ))}
+
+          {loading && (
+            <div className="message ai">
+              <div className="message-content">
+                <div className="message-avatar ai-avatar">🤖</div>
+                <div className="message-text ai-text">
+                  <div className="typing-indicator">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                  </div>
+                  <span className="typing-text">Thinking...</span>
+                </div>
+              </div>
+            </div>
+          )}
+          
+          <div ref={chatEndRef} />
+        </div>
+      </div>
+
+      {/* Input Section */}
+      <div className="input-section">
+        <div className="input-container">
+          <textarea
+            value={question}
+            onChange={e => setQuestion(e.target.value)}
+            onKeyPress={handleKeyPress}
+            placeholder="Ask a question... (Press Enter to send)"
+            className="question-input"
+            rows="1"
+            disabled={loading}
+          />
+          <button 
+            onClick={askQuestion} 
+            disabled={loading || !question.trim()}
+            className="send-button"
+          >
+            {loading ? "⏳" : "🚀"}
+          </button>
+        </div>
       </div>
     </div>
   );
