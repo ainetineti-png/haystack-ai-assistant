@@ -10,3 +10,4 @@ torch
 portalocker
 haystack-ai
 qdrant-haystack
+pymupdf  # Phase 1 structured PDF parsing
