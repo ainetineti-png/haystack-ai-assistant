@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 import os
-from typing import List, Dict, Any, Set
+from typing import List, Dict, Any, Set, Optional  # Added Optional
 import json
 import requests
 import glob
@@ -10,25 +10,546 @@ import pdfplumber
 from docx import Document
 import uuid  # Added for valid UUID point ids
 import hashlib  # For chunk content hashing
-from contextlib import asynccontextmanager  # Added for lifespan
+from contextlib import asynccontextmanager  # re-add lifespan decorator after earlier edit
 import atexit  # Safe shutdown handler
 import unicodedata  # For block normalization
+import statistics  # For table summarization stats
+from collections import OrderedDict  # Added for rerank LRU cache
 # Removed LangExtract import - no longer needed
 from qdrant_client import QdrantClient, models as qdrant_models
 from sentence_transformers import SentenceTransformer
+import sys
+from pathlib import Path
+import time  # For timing operations
 
+# Load environment variables from config.env if it exists
+def load_env_from_file(env_file):
+    if os.path.exists(env_file):
+        print(f"Loading environment from {env_file}")
+        with open(env_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                key, value = line.split('=', 1)
+                os.environ[key] = value
+
+# Try to load from different possible locations
+config_paths = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.env'),  # Project root
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.env'),  # Backend folder
+    os.path.join(os.getcwd(), 'config.env'),  # Current working directory
+    os.path.join(Path(sys.executable).parent, 'config.env')  # Executable directory (for PyInstaller)
+]
+
+for config_path in config_paths:
+    if os.path.exists(config_path):
+        load_env_from_file(config_path)
+        break
+from threading import Lock
+import numpy as np  # ensure np for similarity array handling
+import pickle
+from scipy import sparse as _scipy_sparse  # for persistence of sparse matrix
+
+# ---------------- New: Reload / Supervisor Detection ---------------- #
+IS_RELOAD_SUPERVISOR = os.environ.get('WATCHGOD_RELOADER') == 'true'
+# If running under uvicorn --reload and using embedded Qdrant, concurrent access will fail.
+# We will skip heavy init in supervisor and optionally auto-disable reload for worker if embedded path in use.
+FORCE_DISABLE_RELOAD_FOR_EMBEDDED = os.environ.get('FORCE_DISABLE_RELOAD_FOR_EMBEDDED', '1') == '1'
+# --------------------------------------------------------------- #
+
+# ---------------- New: Deferred heavy init flag ---------------- #
+DEFER_STARTUP_INIT = os.environ.get('DEFER_STARTUP_INIT', '1') == '1'
+_STARTUP_INITIALIZED = False
+# --------------------------------------------------------------- #
+
+# ---------------- New: BM25 Globals ---------------- #
+SPARSE_METHOD = os.environ.get('SPARSE_METHOD', 'tfidf').lower()  # 'tfidf' or 'bm25'
+_bm25_corpus_tokens: List[List[str]] = []
+_bm25_doc_freq: Dict[str, int] = {}
+_bm25_inverted_index: Dict[str, List[tuple]] = {}
+_bm25_doc_len: List[int] = []
+_bm25_avgdl: float = 0.0
+_bm25_k1 = float(os.environ.get('BM25_K1', '1.5'))
+_bm25_b = float(os.environ.get('BM25_B', '0.75'))
+# --------------------------------------------------- #
+
+# Sparse / rerank imports
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+    from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
+    _SPARSE_OK = True
+except Exception:
+    TfidfVectorizer = None  # type: ignore
+    cosine_similarity = None  # type: ignore
+    _SPARSE_OK = False
+try:
+    from sentence_transformers import CrossEncoder
+    _CROSS_ENCODER_MODEL_NAME = os.environ.get('CROSS_ENCODER_MODEL', 'cross-encoder/ms-marco-MiniLM-L-6-v2')
+    _ENABLE_RERANK = os.environ.get('ENABLE_RERANK', '0') == '1'
+    cross_encoder = CrossEncoder(_CROSS_ENCODER_MODEL_NAME) if _ENABLE_RERANK else None
+except Exception:
+    cross_encoder = None
+    _ENABLE_RERANK = False
+
+ENABLE_SPARSE = os.environ.get('ENABLE_SPARSE', '1') == '1'
+SPARSE_MAX_DOCS = int(os.environ.get('SPARSE_MAX_DOCS', '50000'))
+RRF_K = int(os.environ.get('RRF_K', '60'))
+TABLE_SUMMARY_MAX_ROWS = int(os.environ.get('TABLE_SUMMARY_MAX_ROWS', '8'))
+TABLE_SUMMARY_MAX_COLS = int(os.environ.get('TABLE_SUMMARY_MAX_COLS', '8'))
+TABLE_CSV_MAX_CHARS = int(os.environ.get('TABLE_CSV_MAX_CHARS', '20000'))  # New: cap stored CSV size
+ENABLE_SPARSE_PERSIST = os.environ.get('ENABLE_SPARSE_PERSIST', '1') == '1'
+SPARSE_PERSIST_DIR = os.environ.get('SPARSE_PERSIST_DIR', os.path.join(os.path.dirname(__file__), 'sparse_index'))
+# Rerank caching controls
+RERANK_CACHE_SIZE = int(os.environ.get('RERANK_CACHE_SIZE', '5000'))
+RERANK_TOP_N = int(os.environ.get('RERANK_TOP_N', '50'))  # max candidates to send to cross-encoder
+# --------------------------------------------------- #
+
+# New: context assembly / diversity flags
+MAX_CONTEXT_TOKENS = int(os.environ.get('MAX_CONTEXT_TOKENS', '1800'))
+ENABLE_DIVERSITY = os.environ.get('ENABLE_DIVERSITY', '1') == '1'
+TABLE_KEYWORDS = [
+    'table', 'tabulate', 'dataset', 'results', 'values', 'fig.', 'figure', 'data', 'statistics'
+]
+
+_sparse_lock = Lock()
+_sparse_vectorizer = None
+_sparse_matrix = None
+_sparse_payload_refs: List[dict] = []  # store minimal chunk refs
+# Rerank LRU cache: key=(query_md5 + chunk_md5) -> score
+_rerank_cache: 'OrderedDict[str,float]' = OrderedDict()
+
+# Cross-encoder rerank helper (LRU cache)
+
+def _apply_cross_encoder_rerank(query: str, fused: List[dict]):
+    if not fused or cross_encoder is None:
+        return
+    candidates = fused[:RERANK_TOP_N]
+    q_md5 = hashlib.md5(query.encode('utf-8')).hexdigest()
+    pairs = []
+    idxs = []
+    for i, item in enumerate(candidates):
+        chunk_hash = item.get('md5') or item.get('id') or str(i)
+        cache_key = f"{q_md5}|{chunk_hash}"
+        item['_rerank_cache_key'] = cache_key
+        cached = _rerank_cache.get(cache_key)
+        if cached is not None:
+            item['rerank_score'] = cached
+            _rerank_cache.move_to_end(cache_key)
+            continue
+        text = item.get('content') or item.get('text') or ''
+        if not text:
+            item['rerank_score'] = 0.0
+            continue
+        pairs.append((query, text))
+        idxs.append(i)
+    if pairs:
+        try:
+            scores = cross_encoder.predict(pairs)
+            for local_i, score in zip(idxs, scores):
+                cand = candidates[local_i]
+                cand['rerank_score'] = float(score)
+                ck = cand.get('_rerank_cache_key')
+                if ck:
+                    _rerank_cache[ck] = float(score)
+        except Exception as e:
+            print(f"[WARNING] Cross-encoder prediction failed: {e}")
+    while len(_rerank_cache) > RERANK_CACHE_SIZE:
+        try:
+            _rerank_cache.popitem(last=False)
+        except Exception:
+            break
+    for item in candidates:
+        if 'rerank_score' not in item:
+            item['rerank_score'] = 0.0
+    fused.sort(key=lambda x: (-(x.get('rerank_score', 0.0)), -(x.get('rrf_score', 0.0))))
+
+# ---------------- Sparse Persistence Helpers ---------------- #
+
+def _persist_sparse_index():
+    if not ENABLE_SPARSE_PERSIST:
+        return
+    # TF-IDF persistence
+    try:
+        if _sparse_vectorizer is not None and _sparse_matrix is not None:
+            os.makedirs(SPARSE_PERSIST_DIR, exist_ok=True)
+            with open(os.path.join(SPARSE_PERSIST_DIR, 'vectorizer.pkl'), 'wb') as vf:
+                pickle.dump(_sparse_vectorizer, vf)
+            sparse_path = os.path.join(SPARSE_PERSIST_DIR, 'matrix.npz')
+            _scipy_sparse.save_npz(sparse_path, _sparse_matrix)
+            with open(os.path.join(SPARSE_PERSIST_DIR, 'payload_refs.json'), 'w', encoding='utf-8') as pf:
+                json.dump(_sparse_payload_refs, pf)
+    except Exception as e:
+        print(f"[WARNING] Failed to persist TF-IDF sparse index: {e}")
+    # BM25 persistence
+    try:
+        if SPARSE_METHOD == 'bm25' and _bm25_corpus_tokens:
+            os.makedirs(SPARSE_PERSIST_DIR, exist_ok=True)
+            bm25_state = {
+                'corpus_tokens': _bm25_corpus_tokens,
+                'doc_freq': _bm25_doc_freq,
+                'inverted_index': _bm25_inverted_index,
+                'doc_len': _bm25_doc_len,
+                'avgdl': _bm25_avgdl,
+                'payload_refs': _sparse_payload_refs,
+                'k1': _bm25_k1,
+                'b': _bm25_b
+            }
+            with open(os.path.join(SPARSE_PERSIST_DIR, 'bm25_index.pkl'), 'wb') as bf:
+                pickle.dump(bm25_state, bf)
+    except Exception as e:
+        print(f"[WARNING] Failed to persist BM25 index: {e}")
+    try:
+        print(f"[INFO] Persisted sparse index to {SPARSE_PERSIST_DIR}")
+    except Exception:
+        pass
+
+def _load_sparse_index_from_disk():
+    global _sparse_vectorizer, _sparse_matrix, _sparse_payload_refs
+    global _bm25_corpus_tokens, _bm25_doc_freq, _bm25_inverted_index, _bm25_doc_len, _bm25_avgdl
+    if not ENABLE_SPARSE_PERSIST:
+        return
+    # Load TF-IDF if present (even if SPARSE_METHOD is bm25, for debugging)
+    try:
+        vec_path = os.path.join(SPARSE_PERSIST_DIR, 'vectorizer.pkl')
+        mat_path = os.path.join(SPARSE_PERSIST_DIR, 'matrix.npz')
+        refs_path = os.path.join(SPARSE_PERSIST_DIR, 'payload_refs.json')
+        if os.path.isfile(vec_path) and os.path.isfile(mat_path) and os.path.isfile(refs_path):
+            with open(vec_path, 'rb') as vf:
+                _sparse_vectorizer = pickle.load(vf)
+            _sparse_matrix = _scipy_sparse.load_npz(mat_path)
+            with open(refs_path, 'r', encoding='utf-8') as pf:
+                _sparse_payload_refs = json.load(pf)
+            print(f"[INFO] Loaded persisted TF-IDF index: docs={len(_sparse_payload_refs)} features={_sparse_matrix.shape[1] if _sparse_matrix is not None else 0}")
+    except Exception as e:
+        print(f"[WARNING] Could not load persisted TF-IDF index: {e}")
+    # Load BM25 if requested
+    if SPARSE_METHOD == 'bm25':
+        try:
+            bm25_path = os.path.join(SPARSE_PERSIST_DIR, 'bm25_index.pkl')
+            if os.path.isfile(bm25_path):
+                with open(bm25_path, 'rb') as bf:
+                    state = pickle.load(bf)
+                _bm25_corpus_tokens = state.get('corpus_tokens', [])
+                _bm25_doc_freq = state.get('doc_freq', {})
+                _bm25_inverted_index = state.get('inverted_index', {})
+                _bm25_doc_len = state.get('doc_len', [])
+                _bm25_avgdl = state.get('avgdl', 0.0)
+                _sparse_payload_refs = state.get('payload_refs', [])  # reuse refs
+                print(f"[INFO] Loaded persisted BM25 index: docs={len(_bm25_corpus_tokens)} avgdl={_bm25_avgdl:.2f}")
+        except Exception as e:
+            print(f"[WARNING] Could not load persisted BM25 index: {e}")
+# ---------------- End Sparse Persistence Helpers ---------------- #
+
+# Define lifespan before app instantiation (ensure AVAILABLE global symbols referenced inside) 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load documents at startup only if AUTO_INGEST
-    if AUTO_INGEST:
-        load_documents()
+    global _STARTUP_INITIALIZED, embedder, qdrant_client
+    # Perform heavy initialization only once at real server startup (not in reloader supervisor)
+    if DEFER_STARTUP_INIT and not _STARTUP_INITIALIZED:
+        try:
+            # Initialize Qdrant client
+            if qdrant_client is None:
+                _initialize_qdrant_client()
+            # Load embedding model lazily
+            if embedder is None:
+                default_model_path_local = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "all-MiniLM-L6-v2")
+                model_path_local = os.environ.get("EMBED_MODEL_PATH", default_model_path_local)
+                print(f"[INIT] Deferred model load from: {model_path_local}")
+                try:
+                    embedder = SentenceTransformer(model_path_local)
+                    print(f"[INIT] Successfully loaded embedding model (deferred) from: {model_path_local}")
+                except Exception as e:
+                    print(f"[WARNING] Deferred model load failed: {e}")
+                    embedder = None
+            _STARTUP_INITIALIZED = True
+        except Exception as e:
+            print(f"[WARNING] Deferred heavy init encountered error: {e}")
+    # Only ingest after heavy init to ensure embedder/qdrant available
+    if DEFER_STARTUP_INIT:
+        if 'AUTO_INGEST' in globals() and globals().get('AUTO_INGEST'):
+            try:
+                load_documents()
+            except Exception as e:
+                print(f"[WARNING] Initial load_documents failed (deferred): {e}")
+        else:
+            print("[INFO] AUTO_INGEST disabled; skipping ingestion at startup (deferred)")
     else:
-        print("[INFO] AUTO_INGEST disabled; skipping ingestion at startup")
+        # Original path (no defer) retains previous behavior
+        if 'AUTO_INGEST' in globals() and globals().get('AUTO_INGEST'):
+            try:
+                load_documents()
+            except Exception as e:
+                print(f"[WARNING] Initial load_documents failed: {e}")
+        else:
+            print("[INFO] AUTO_INGEST disabled; skipping ingestion at startup")
+    # Attempt to load persisted sparse index after initial load
+    _load_sparse_index_from_disk()
     try:
         yield
     finally:
+        try:
             _safe_close_qdrant()
+        except Exception:
+            pass
 
+# ---------------- Sparse / Hybrid Retrieval Helpers (Phase 3) ---------------- #
+
+def _tokenize(text: str) -> List[str]:
+    return [t for t in text.lower().split() if t]
+
+def _build_sparse_index():
+    # If vectorizer class unavailable and method tfidf, skip
+    if SPARSE_METHOD == 'tfidf' and TfidfVectorizer is None:
+        return
+    """Build a sparse index over all chunk texts currently in Qdrant.
+    Supports TF-IDF (default) or BM25 based on SPARSE_METHOD env variable.
+    Thread-safe under _sparse_lock."""
+    global _sparse_vectorizer, _sparse_matrix, _sparse_payload_refs
+    global _bm25_corpus_tokens, _bm25_doc_freq, _bm25_inverted_index, _bm25_doc_len, _bm25_avgdl
+    if not (ENABLE_SPARSE and _SPARSE_OK and embedder is not None):
+        # Allow BM25 even if scikit is missing (we don't depend on sklearn for BM25)
+        if SPARSE_METHOD != 'bm25':
+            return
+    if qdrant_client is None:
+        print("[INFO] Qdrant client not available - skipping sparse index build")
+        return
+    try:
+        with _sparse_lock:
+            texts: List[str] = []
+            refs: List[dict] = []
+            if QDRANT_COLLECTION not in [c.name for c in qdrant_client.get_collections().collections]:
+                print("[INFO] Qdrant collection not found - skipping sparse index build")
+                return
+            offset = None
+            batch = 512
+            count = 0
+            while True:
+                points, offset = qdrant_client.scroll(collection_name=QDRANT_COLLECTION, scroll_filter=None, limit=batch, with_payload=True, offset=offset)
+                if not points:
+                    break
+                for pt in points:
+                    if count >= SPARSE_MAX_DOCS:
+                        break
+                    payload = pt.payload or {}
+                    text = payload.get('text')
+                    if not text:
+                        continue
+                    texts.append(text)
+                    refs.append({
+                        'id': str(pt.id),
+                        'filename': payload.get('filename'),
+                        'page': payload.get('page'),
+                        'chunk_index': payload.get('chunk_index'),
+                        'heading_path': payload.get('heading_path'),
+                        'block_types': payload.get('block_types'),
+                        'md5': payload.get('md5'),  # added for rerank caching key
+                        'text': text
+                    })
+                    count += 1
+                if count >= SPARSE_MAX_DOCS or offset is None:
+                    break
+            if not texts:
+                print("[INFO] No texts found for sparse index build")
+                return
+            _sparse_payload_refs = refs
+            if SPARSE_METHOD == 'tfidf':
+                if TfidfVectorizer is None:  # Defensive guard for type checker
+                    return
+                try:
+                    _sparse_vectorizer = TfidfVectorizer(max_df=0.9, min_df=1, ngram_range=(1,2))
+                    _sparse_matrix = _sparse_vectorizer.fit_transform(texts)
+                    print(f"[INFO] Built TF-IDF index: docs={len(refs)} features={_sparse_matrix.shape[1]}")
+                except Exception as ve:
+                    print(f"[WARNING] TF-IDF vectorizer build failed: {ve}")
+                    return
+            else:  # BM25
+                _bm25_corpus_tokens = []
+                _bm25_doc_freq = {}
+                _bm25_inverted_index = {}
+                _bm25_doc_len = []
+                for doc_idx, txt in enumerate(texts):
+                    tokens = _tokenize(txt)
+                    _bm25_corpus_tokens.append(tokens)
+                    _bm25_doc_len.append(len(tokens))
+                    tf_local: Dict[str, int] = {}
+                    for t in tokens:
+                        tf_local[t] = tf_local.get(t, 0) + 1
+                    for term, tf in tf_local.items():
+                        _bm25_doc_freq[term] = _bm25_doc_freq.get(term, 0) + 1
+                        _bm25_inverted_index.setdefault(term, []).append((doc_idx, tf))
+                N = len(_bm25_corpus_tokens)
+                _bm25_avgdl = sum(_bm25_doc_len)/N if N else 0.0
+                print(f"[INFO] Built BM25 index: docs={N} avgdl={_bm25_avgdl:.2f} vocab={len(_bm25_doc_freq)}")
+            _persist_sparse_index()
+    except Exception as e:
+        print(f"[WARNING] Failed to build sparse index: {e}")
+
+
+def _sparse_search(query: str, top_k: int) -> List[dict]:
+    if SPARSE_METHOD == 'bm25':
+        return _bm25_search(query, top_k)
+    # TF-IDF path (existing)
+    if TfidfVectorizer is None or cosine_similarity is None:
+        return []
+    try:
+        q_vec = _sparse_vectorizer.transform([query]) if _sparse_vectorizer is not None else None
+        if q_vec is None or _sparse_matrix is None:
+            return []
+        sims_arr = cosine_similarity(q_vec, _sparse_matrix).ravel() if cosine_similarity is not None else None
+        if sims_arr is None or getattr(sims_arr, 'size', 0) == 0:
+            return []
+        sims = np.asarray(sims_arr)
+        top_idx = sims.argsort()[::-1][:top_k]
+        results = []
+        for rank, idx in enumerate(top_idx):
+            ref = _sparse_payload_refs[idx]
+            results.append({
+                'id': ref['id'],
+                'filename': ref['filename'],
+                'page': ref['page'],
+                'chunk_index': ref['chunk_index'],
+                'heading_path': ref.get('heading_path'),
+                'block_types': ref.get('block_types'),
+                'content': ref['text'],
+                'md5': ref.get('md5'),  # propagate md5
+                'score': float(sims[idx]),
+                'source': 'sparse_tfidf',
+                'rank': rank+1
+            })
+        return results
+    except Exception as e:
+        print(f"[WARNING] Sparse search failed: {e}")
+        return []
+
+
+def _bm25_search(query: str, top_k: int) -> List[dict]:
+    if SPARSE_METHOD != 'bm25' or not _bm25_corpus_tokens:
+        return []
+    try:
+        q_terms = _tokenize(query)
+        if not q_terms:
+            return []
+        scores: Dict[int, float] = {}
+        N = len(_bm25_corpus_tokens)
+        avgdl = _bm25_avgdl if _bm25_avgdl else 1.0
+        k1 = _bm25_k1
+        b = _bm25_b
+        seen_docs: Set[int] = set()
+        for qt in q_terms:
+            postings = _bm25_inverted_index.get(qt)
+            if not postings:
+                continue
+            df = _bm25_doc_freq.get(qt, 0)
+            # BM25 IDF (Robertson/Sparck Jones)
+            idf = np.log(1 + (N - df + 0.5)/(df + 0.5)) if df else 0.0
+            for doc_idx, tf in postings:
+                dl = _bm25_doc_len[doc_idx] or 1
+                denom = tf + k1 * (1 - b + b * dl / avgdl)
+                score_add = idf * (tf * (k1 + 1)) / denom if denom else 0.0
+                scores[doc_idx] = scores.get(doc_idx, 0.0) + score_add
+                seen_docs.add(doc_idx)
+        if not scores:
+            return []
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        results: List[dict] = []
+        for rank, (doc_idx, sc) in enumerate(ranked, start=1):
+            ref = _sparse_payload_refs[doc_idx]
+            results.append({
+                'id': ref['id'],
+                'filename': ref['filename'],
+                'page': ref['page'],
+                'chunk_index': ref['chunk_index'],
+                'heading_path': ref.get('heading_path'),
+                'block_types': ref.get('block_types'),
+                'content': ref['text'],
+                'md5': ref.get('md5'),  # propagate md5
+                'score': float(sc),
+                'source': 'sparse_bm25',
+                'rank': rank
+            })
+        return results
+    except Exception as e:
+        print(f"[WARNING] BM25 search failed: {e}")
+        return []
+
+
+def _dense_search_internal(query: str, top_k: int) -> List[dict]:
+    if embedder is None or qdrant_client is None:
+        return []
+    try:
+        query_vec = embedder.encode(query).tolist()
+        try:
+            qp = qdrant_client.query_points(collection_name=QDRANT_COLLECTION, query=query_vec, limit=top_k, with_payload=True)
+            hits = qp.points
+        except Exception:
+            hits = qdrant_client.search(collection_name=QDRANT_COLLECTION, query_vector=query_vec, limit=top_k, with_payload=True)
+        out = []
+        for rank, hit in enumerate(hits):
+            payload = hit.payload or {}
+            out.append({
+                'id': str(hit.id),
+                'filename': payload.get('filename'),
+                'page': payload.get('page'),
+                'chunk_index': payload.get('chunk_index'),
+                'heading_path': payload.get('heading_path'),
+                'block_types': payload.get('block_types'),
+                'content': payload.get('text', ''),
+                'md5': payload.get('md5'),  # for rerank cache
+                'score': float(hit.score) if hasattr(hit, 'score') else 0.0,
+                'source': 'dense',
+                'rank': rank+1
+            })
+        return out
+    except Exception as e:
+        print(f"[WARNING] Dense search failed: {e}")
+        return []
+
+
+def _rrf_fuse(dense: List[dict], sparse: List[dict], final_k: int) -> List[dict]:
+    """Reciprocal Rank Fusion over two ranked lists."""
+    fused: Dict[str, dict] = {}
+    for lst in (dense, sparse):
+        for item in lst:
+            key = item['id']
+            rank = item['rank']
+            contrib = 1.0 / (RRF_K + rank)
+            if key not in fused:
+                fused[key] = {**item, 'rrf_score': contrib}
+            else:
+                fused[key]['rrf_score'] += contrib
+    fused_list = list(fused.values())
+    fused_list.sort(key=lambda x: (-x['rrf_score'], x['filename'] or '', x['page'] or 0))
+    return fused_list[:final_k]
+
+
+def hybrid_search(query: str, top_k_dense: int = 20, top_k_sparse: int = 20, final_k: int = 5) -> List[dict]:
+    dense_hits = _dense_search_internal(query, top_k_dense) if embedder is not None else []
+    sparse_hits = _sparse_search(query, top_k_sparse)
+    if not dense_hits and not sparse_hits:
+        return []
+    fused = _rrf_fuse(dense_hits, sparse_hits, final_k * 3)
+    # Optional cross-encoder rerank with caching
+    if cross_encoder is not None and _ENABLE_RERANK and fused:
+        try:
+            _apply_cross_encoder_rerank(query, fused)
+        except Exception as e:
+            print(f"[WARNING] Cross-encoder rerank failed: {e}")
+    final = fused[:final_k]
+    return [
+        {
+            'filename': c['filename'],
+            'content': c['content'],
+            'page': c['page'],
+            'chunk_index': c['chunk_index'],
+            'heading_path': c.get('heading_path'),
+            'block_types': c.get('block_types'),
+            'md5': c.get('md5')
+        } for c in final
+    ]
+# ---------------- End Sparse / Hybrid Retrieval Helpers ---------------- #
+
+# Instantiate app here after helper definitions (lifespan previously defined above)
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
@@ -38,7 +559,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Use environment variables with fallbacks for paths
+DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 documents = []
 last_loaded_files = {}
 
@@ -47,15 +569,58 @@ ingest_total_files = 0
 ingest_processed_files = 0
 
 # Qdrant setup (embedded/local mode)
-QDRANT_PATH = os.path.join(os.path.dirname(__file__), "qdrant_storage")
+# Use environment variable with fallback for Qdrant path
+QDRANT_PATH = os.environ.get("QDRANT_PATH", os.path.join(os.path.dirname(__file__), "qdrant_storage"))
 QDRANT_COLLECTION = "documents"
-qdrant_client = QdrantClient(path=QDRANT_PATH)
+print(f"Using Qdrant storage path: {QDRANT_PATH}" if not IS_RELOAD_SUPERVISOR else "[SUPERVISOR] Detected reloader supervisor; deferring embedded Qdrant init")
 
-# Disable noisy destructor that triggers portalocker ImportError at shutdown
-try:
-    qdrant_client.__del__ = lambda self: None  # type: ignore
-except Exception:
-    pass
+# Create Qdrant storage directory if it doesn't exist
+os.makedirs(QDRANT_PATH, exist_ok=True)
+
+# Initialize Qdrant client with the configured path
+qdrant_client = None
+
+def _initialize_qdrant_client():
+    global qdrant_client
+    if qdrant_client is not None:
+        return qdrant_client
+    
+    try:
+        qdrant_client = QdrantClient(path=QDRANT_PATH)
+        print(f"Successfully initialized Qdrant client with path: {QDRANT_PATH}")
+        
+        # Disable noisy destructor that triggers portalocker ImportError at shutdown
+        try:
+            qdrant_client.__del__ = lambda self: None  # type: ignore
+        except Exception:
+            pass
+            
+        return qdrant_client
+    except Exception as e:
+        print(f"Error initializing Qdrant client: {e}")
+        # If it's a lock error, try to wait and retry once
+        if "already accessed by another instance" in str(e):
+            import time
+            print("Waiting 2 seconds and retrying Qdrant initialization...")
+            time.sleep(2)
+            try:
+                qdrant_client = QdrantClient(path=QDRANT_PATH)
+                print(f"Successfully initialized Qdrant client on retry with path: {QDRANT_PATH}")
+                try:
+                    qdrant_client.__del__ = lambda self: None  # type: ignore
+                except Exception:
+                    pass
+                return qdrant_client
+            except Exception as retry_e:
+                print(f"Retry failed: {retry_e}")
+                qdrant_client = None
+        else:
+            qdrant_client = None
+        return None
+
+# Try initial initialization
+if not DEFER_STARTUP_INIT and not IS_RELOAD_SUPERVISOR:
+    _initialize_qdrant_client()
 
 
 def _safe_close_qdrant():
@@ -72,15 +637,20 @@ def _safe_close_qdrant():
 atexit.register(_safe_close_qdrant)
 
 # Embedding model setup (local path to avoid SSL). Set EMBED_MODEL_PATH env var to a local folder.
-model_path = os.environ.get("EMBED_MODEL_PATH", "C:\\HayStack\\models\\all-MiniLM-L6-v2")
-print(f"Attempting to load model from: {model_path}")
-print(f"Path exists: {os.path.exists(model_path)}")
-print(f"Path is absolute: {os.path.isabs(model_path)}")
+# Use a relative path as default fallback instead of hardcoded absolute path
+default_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models", "all-MiniLM-L6-v2")
+model_path = os.environ.get("EMBED_MODEL_PATH", default_model_path)
+print(f"Attempting to load model from: {model_path}" if not IS_RELOAD_SUPERVISOR else "[SUPERVISOR] Skipping model load (deferred)")
+print(f"Path exists: {os.path.exists(model_path)}" if not IS_RELOAD_SUPERVISOR else "")
+print(f"Path is absolute: {os.path.isabs(model_path)}" if not IS_RELOAD_SUPERVISOR else "")
 
 try:
-    # Try to load the model from local path
-    embedder = SentenceTransformer(model_path)
-    print(f"Successfully loaded local embedding model from: {model_path}")
+    if not DEFER_STARTUP_INIT:  # Only load at import time if not deferring
+        # Try to load the model from local path
+        embedder = SentenceTransformer(model_path)
+        print(f"Successfully loaded local embedding model from: {model_path}")
+    else:
+        embedder = None  # Will be loaded in lifespan
 except Exception as e:
     print(f"Warning: Could not load sentence transformer model from '{model_path}': {e}")
     print("Using simple keyword-based search only")
@@ -248,6 +818,9 @@ ingest_pages_reindexed = 0
 # Helper: delete all vector points for a given relative filename
 
 def delete_file_points(rel_filename: str):
+    if qdrant_client is None:
+        print(f"[WARNING] Cannot delete vectors for {rel_filename}: Qdrant client not available")
+        return
     try:
         from qdrant_client.http import models as rest_models
         qdrant_client.delete(
@@ -267,7 +840,7 @@ def delete_file_points(rel_filename: str):
 
 def delete_file_pages_points(rel_filename: str, pages: List[int]):
     """Delete only vectors for specific pages of a file."""
-    if not pages:
+    if not pages or qdrant_client is None:
         return
     try:
         for p in pages:
@@ -336,6 +909,10 @@ def load_documents():
             collection_name=QDRANT_COLLECTION,
             vectors_config=qdrant_models.VectorParams(size=384, distance=qdrant_models.Distance.COSINE)
         )
+    elif qdrant_client is None:
+        print("[WARNING] Qdrant client not available - vector operations will be skipped")
+    elif embedder is None:
+        print("[WARNING] Embedder not available - vector operations will be skipped")
     updated_manifest_files = files_section
 
     # Early exit if force reindex not requested and all hashes + schema match (schema optional for legacy entries)
@@ -504,7 +1081,7 @@ def load_documents():
                 chunk_list_to_embed = chunk_list
             chunk_md5s_all_previous = set(prev_entry.get('chunk_md5s', [])) if prev_entry else set()
             new_chunk_md5s: List[str] = []
-            if embedder is not None and chunk_list_to_embed:
+            if embedder is not None and qdrant_client is not None and chunk_list_to_embed:
                 points = []
                 for ch in chunk_list_to_embed:
                     try:
@@ -531,6 +1108,21 @@ def load_documents():
                         # Include table metadata if this chunk is a single table block
                         if 'block_types' in ch and len(ch['block_types']) == 1 and ch['block_types'][0] == 'table':
                             payload['table_markdown'] = ch['text'][:5000]
+                            # Attach summary if available
+                            # Attempt to parse summary from first line heuristic
+                            if '\n' in ch['text']:
+                                first_line = ch['text'].split('\n',1)[0]
+                                if 'rows=' in first_line and 'cols=' in first_line:
+                                    payload['table_summary'] = first_line[:300]
+                            # Propagate table metadata if available from block accumulation
+                            if 'table_md5' in ch:
+                                payload['table_md5'] = ch['table_md5']
+                            if 'table_csv' in ch:
+                                payload['table_csv'] = ch['table_csv'][:TABLE_CSV_MAX_CHARS]
+                            if 'n_rows' in ch:
+                                payload['n_rows'] = ch['n_rows']
+                            if 'n_cols' in ch:
+                                payload['n_cols'] = ch['n_cols']
                         points.append(qdrant_models.PointStruct(id=point_id, vector=embedding, payload=payload))
                         new_chunk_md5s.append(ch['md5'])
                     except Exception as embed_error:
@@ -544,6 +1136,8 @@ def load_documents():
                         print(f"[ERROR] Upsert failed for {fpath}: {up_err}")
             elif embedder is None:
                 print(f"[INFO] Skipping vector storage for {rel} (no embedder available)")
+            elif qdrant_client is None:
+                print(f"[INFO] Skipping vector storage for {rel} (Qdrant client not available)")
             else:
                 print(f"[WARNING] No chunks produced for {rel}")
             # Merge chunk md5s
@@ -580,6 +1174,7 @@ def load_documents():
 
     manifest['files'] = updated_manifest_files
     _save_manifest(manifest)
+    _build_sparse_index()
 
 
 def simple_search(query: str, docs: List[dict], top_k: int = 3) -> List[dict]:
@@ -599,7 +1194,7 @@ def simple_search(query: str, docs: List[dict], top_k: int = 3) -> List[dict]:
 
 
 def vector_search(query: str, top_k: int = 3) -> List[dict]:
-    if embedder is None:
+    if embedder is None or qdrant_client is None:
         return []
     try:
         query_vec = embedder.encode(query).tolist()
@@ -636,44 +1231,107 @@ def vector_search(query: str, top_k: int = 3) -> List[dict]:
 
 
 def generate_answer(question: str, context_docs: List[dict]) -> str:
-    """Answer generation using Llama3 via Ollama API"""
+    """Answer generation using Llama3 via Ollama API with adaptive timeout and retry"""
     print(f"[DEBUG] Received question: {question}")
     print(f"[DEBUG] Context docs: {[doc['filename'] for doc in context_docs]}")
     if not context_docs:
         print("[DEBUG] No relevant documents found.")
         return "I couldn't find relevant information to answer your question."
 
-    context_text = "\n\n".join([f"From {doc.get('filename','unknown')} (page {doc.get('page','?')}):\n{doc.get('content','')[:500]}..." for doc in context_docs])
-    prompt = f"Answer the following question using the provided context.\n\nQuestion: {question}\n\nContext:\n{context_text}"
-    print(f"[DEBUG] Sending prompt to Ollama: {prompt[:200]}...")
-    try:
-        response = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3:latest",
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=60
-        )
-        print(f"[DEBUG] Ollama response status: {response.status_code}")
-        response.raise_for_status()
-        data = response.json()
-        print(f"[DEBUG] Ollama raw response: {data}")
-        answer = data.get("response", "Sorry, I couldn't generate an answer.")
-        print(f"[DEBUG] Final answer: {answer[:200]}...")
-        return answer
-    except requests.exceptions.ConnectionError as e:
-        print(f"[ERROR] Connection error: {e}")
-        return "Error: Ollama is not running. Please start Ollama first."
-    except requests.exceptions.Timeout as e:
-        print(f"[ERROR] Timeout error: {e}")
-        return "Error: Request to Ollama timed out. The model might be loading."
-    except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
-        return f"Error communicating with Ollama: {str(e)}"
+    # Optimize context by limiting the number of documents and snippet length
+    max_docs = min(len(context_docs), 8)  # Limit to 8 most relevant documents
+    snippet_length = 300  # Initial snippet length
+    
+    # Adaptive timeout and retry mechanism
+    max_retries = 3  # Increased from 2 to 3
+    initial_timeout = 90  # Initial timeout in seconds
+    min_timeout = 30  # Minimum timeout for subsequent retries
+    timeout_reduction_factor = 0.7  # Reduce timeout by 30% on each retry
+    
+    # Track timeouts to reduce context size on multiple timeouts
+    timeout_count = 0
+    
+    for attempt in range(max_retries + 1):
+        # Adjust context size if we've had multiple timeouts
+        current_max_docs = max(4, max_docs - timeout_count)  # Reduce docs but keep at least 4
+        current_snippet_length = max(150, snippet_length - (timeout_count * 50))  # Reduce snippet length but keep at least 150 chars
+        
+        # Build context with current parameters
+        context_text = "\n\n".join([f"From {doc.get('filename','unknown')} (page {doc.get('page','?')}):\n{doc.get('content','')[:current_snippet_length]}..." 
+                                for doc in context_docs[:current_max_docs]])
+        
+        # Streamlined prompt to reduce size
+        prompt = f"Answer the following question using ONLY the provided context. Be concise.\n\nQuestion: {question}\n\nContext:\n{context_text}"
+        
+        # Calculate current timeout (reduce on each retry)
+        current_timeout = max(min_timeout, initial_timeout * (timeout_reduction_factor ** attempt))
+        
+        print(f"[INFO] Attempt {attempt+1}/{max_retries+1}: Using {current_max_docs} docs, {current_snippet_length} chars per snippet, {current_timeout:.1f}s timeout")
+        print(f"[DEBUG] Sending prompt to Ollama: {prompt[:200]}...")
+        
+        try:
+            print(f"[INFO] Sending request to Ollama (attempt {attempt+1}/{max_retries+1})")
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3:latest",
+                    "prompt": prompt,
+                    "stream": False,
+                    "temperature": 0.7  # Add temperature parameter to potentially speed up generation
+                },
+                timeout=current_timeout
+            )
+            print(f"[DEBUG] Ollama response status: {response.status_code}")
+            response.raise_for_status()
+            data = response.json()
+            answer = data.get("response", "")
+            
+            # Check for empty response
+            if not answer.strip():
+                print(f"[WARNING] Empty response received on attempt {attempt+1}")
+                if attempt < max_retries:
+                    timeout_count += 1  # Treat empty response like a timeout
+                    continue
+                else:
+                    return "Error: Received empty response from Ollama. Please try again with a simpler question."
+            
+            print(f"[DEBUG] Final answer: {answer[:200]}...")
+            print(f"[INFO] Ollama response received successfully on attempt {attempt+1}")
+            return answer
+            
+        except requests.exceptions.ConnectionError as e:
+            print(f"[ERROR] Connection error on attempt {attempt+1}: {e}")
+            # For connection errors, we might need to wait longer for Ollama to recover
+            if attempt < max_retries:
+                wait_time = (attempt + 1) * 3  # Longer wait for connection issues
+                print(f"[INFO] Connection issue - waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            else:
+                return "Error: Cannot connect to Ollama. Please check if Ollama is running and restart if necessary."
+                
+        except requests.exceptions.Timeout as e:
+            print(f"[WARNING] Timeout on attempt {attempt+1}/{max_retries+1}: {e}")
+            timeout_count += 1
+            
+            if attempt < max_retries:
+                # Wait before retrying, with increasing backoff
+                wait_time = (attempt + 1) * 2
+                print(f"[INFO] Timeout occurred - waiting {wait_time} seconds before retry with reduced context...")
+                time.sleep(wait_time)
+            else:
+                return f"Error: Request to Ollama timed out after {max_retries+1} attempts. Try asking a simpler question or check if Ollama is running properly."
+                
+        except Exception as e:
+            print(f"[ERROR] Unexpected error on attempt {attempt+1}: {e}")
+            if attempt < max_retries:
+                wait_time = (attempt + 1) * 2
+                print(f"[INFO] Error occurred - waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            else:
+                return f"Error: Unexpected issue when generating answer: {str(e)}. Please try again later."
+            import traceback
+            traceback.print_exc()
+            return f"Error communicating with Ollama: {str(e)}"
 
 
 @app.get("/ingest")
@@ -683,45 +1341,291 @@ def ingest():
 
 @app.get("/health")
 def health_check():
-    """Check if Ollama and Llama3 are available"""
+    """Check if Ollama and Llama3 are available with detailed diagnostics"""
     try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
+        # Use a shorter timeout for health checks
+        response = requests.get("http://localhost:11434/api/tags", timeout=3)
         response.raise_for_status()
         models = response.json().get("models", [])
         llama3_available = any("llama3" in model.get("name", "") for model in models)
         
+        # Check if the model is ready by sending a minimal request
+        if llama3_available:
+            try:
+                # Send a minimal prompt to check if model is responsive
+                test_response = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": "llama3:latest",
+                        "prompt": "Hello",
+                        "stream": False,
+                        "temperature": 0.7
+                    },
+                    timeout=3
+                )
+                test_response.raise_for_status()
+                
+                # Check for empty response
+                response_data = test_response.json()
+                if not response_data.get("response"):
+                    print("[WARNING] Model returned empty response")
+                    model_ready = False
+                    model_error = "Model returned empty response"
+                else:
+                    model_ready = True
+                    model_error = None
+            except requests.exceptions.Timeout as model_timeout:
+                print(f"[WARNING] Model health check timed out: {model_timeout}")
+                model_ready = False
+                model_error = "Model response timed out"
+            except requests.exceptions.ConnectionError as model_conn_err:
+                print(f"[WARNING] Model health check connection error: {model_conn_err}")
+                model_ready = False
+                model_error = "Connection error during model check"
+            except Exception as model_err:
+                print(f"[WARNING] Model health check failed: {model_err}")
+                model_ready = False
+                model_error = str(model_err)
+        else:
+            model_ready = False
+            model_error = "Llama3 model not found in available models"
+            
         return {
             "ollama_running": True,
             "llama3_available": llama3_available,
-            "available_models": [model.get("name", "") for model in models]
+            "model_ready": model_ready,
+            "available_models": [model.get("name", "") for model in models],
+            "model_error": model_error if not model_ready else None
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "ollama_running": False,
+            "llama3_available": False,
+            "model_ready": False,
+            "error": "Connection to Ollama timed out",
+            "troubleshooting": "Check if Ollama is running but overloaded or unresponsive"
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "ollama_running": False,
+            "llama3_available": False,
+            "model_ready": False,
+            "error": "Ollama is not running",
+            "troubleshooting": "Start Ollama service or check if it's running on a different port"
         }
     except Exception as e:
         return {
             "ollama_running": False,
             "llama3_available": False,
-            "error": str(e)
+            "model_ready": False,
+            "error": str(e),
+            "troubleshooting": "Unexpected error, check Ollama installation and configuration"
         }
+
+# Simple LRU cache for recent questions to avoid redundant processing
+from functools import lru_cache
+
+@lru_cache(maxsize=20)
+def get_context_for_question(question: str, use_hybrid: bool, top_k_dense=6, top_k_sparse=6, final_k=6):
+    """Cache context retrieval for similar questions with optimized parameters"""
+    if use_hybrid:
+        raw_docs = hybrid_search(question, top_k_dense=top_k_dense, top_k_sparse=top_k_sparse, final_k=final_k)
+        return assemble_context(question, raw_docs, max_tokens=MAX_CONTEXT_TOKENS)
+    elif embedder is not None and qdrant_client is not None and QDRANT_COLLECTION in [c.name for c in qdrant_client.get_collections().collections]:
+        raw_docs = vector_search(question, top_k=final_k)
+        return assemble_context(question, raw_docs, max_tokens=MAX_CONTEXT_TOKENS)
+    else:
+        print("[INFO] Using simple search fallback")
+        return simple_search(question, documents, top_k=final_k)
 
 @app.post("/ask")
 async def ask(request: Request):
     print("[DEBUG] /ask endpoint called")
+    start_time = time.time()
     data = await request.json()
     question = data.get("question", "")
     print(f"[DEBUG] Question received: '{question}'")
     if not question:
         print("[DEBUG] No question provided")
         return {"error": "Question is required"}
-    # Prefer vector search if embeddings available
-    if embedder is not None and qdrant_client is not None and QDRANT_COLLECTION in [c.name for c in qdrant_client.get_collections().collections]:
-        context_docs = vector_search(question, top_k=3)
-    else:
-        context_docs = simple_search(question, documents)
-    answer = generate_answer(question, context_docs)
-    context = [f"{doc['filename']}: {doc['content'][:200]}..." for doc in context_docs]
+    
+    # Try to initialize Qdrant client if not available
+    if qdrant_client is None:
+        _initialize_qdrant_client()
+    
+    # Determine search method
+    use_hybrid = ENABLE_SPARSE and _SPARSE_OK and embedder is not None and qdrant_client is not None
+    
+    try:
+        # Get context with caching - optimized parameters for better performance
+        context_time_start = time.time()
+        try:
+            # Use optimized parameters for context retrieval
+            context_docs = get_context_for_question(question, use_hybrid)
+        except Exception as context_error:
+            print(f"[ERROR] Context retrieval failed: {context_error}")
+            # Fallback to simpler search method
+            context_docs = simple_search(question, documents, top_k=5)
+            
+        context_time = time.time() - context_time_start
+        print(f"[TIMING] Context retrieval took {context_time:.2f}s")
+        
+        # Generate answer with improved error handling
+        answer_time_start = time.time()
+        try:
+            answer, citations = generate_answer_with_citations(question, context_docs)
+        except Exception as answer_error:
+            print(f"[ERROR] Answer generation failed: {answer_error}")
+            # Force fallback path
+            answer = f"Error: Failed to generate answer: {str(answer_error)}"
+            citations = []
+            
+        answer_time = time.time() - answer_time_start
+        print(f"[TIMING] Answer generation took {answer_time:.2f}s")
+        
+        # Fallback if LLM call failed or timed out
+        if answer.lower().startswith("error"):  # Ollama error fallback
+            print("[WARNING] LLM generation failed, using extractive fallback response")
+            # Build extractive summary from top context
+            summary_lines = []
+            for d in context_docs[:4]:  # Use 4 docs for faster response
+                snippet = (d.get('content','') or '')[:120].strip().replace("\n", " ")  # 120 chars per snippet
+                summary_lines.append(f"- {d.get('filename')} (page {d.get('page')}): {snippet}...")
+            
+            # Extract error message for better user feedback
+            error_msg = answer.split("Error:", 1)[1].strip() if "Error:" in answer else "Unknown error"
+            error_msg = error_msg.split(".", 1)[0] + "." if "." in error_msg else error_msg
+            answer = f"I'm sorry, I couldn't generate an answer at this time ({error_msg}). Here are the relevant excerpts:\n" + "\n".join(summary_lines)
+        
+        # Prepare context snippets for frontend display - optimized to 6 docs
+        context_for_display = []
+        for doc in context_docs[:6]:  # 6 docs is a good balance
+            snippet = (doc.get('content','') or '')[:120].strip()  # 120 chars per snippet
+            context_for_display.append({
+                "id": doc.get('citation_id', 0),
+                "filename": doc.get('filename', 'Unknown'),
+                "page": doc.get('page', 0),
+                "content": snippet
+            })
+        
+        total_time = time.time() - start_time
+        print(f"[TIMING] Total processing took {total_time:.2f}s")
+        
+        return {
+            "answer": answer,
+            "context": context_for_display,
+            "documents_found": len(context_docs),
+            "citations": citations,
+            "processing_time": round(total_time, 2)
+        }
+    except requests.exceptions.Timeout as e:
+        print(f"[ERROR] Timeout in /ask endpoint: {e}")
+        # Specific handling for timeout errors
+        try:
+            # Get fewer documents for extractive summary
+            context_docs = simple_search(question, documents, top_k=4)  # Use simple search as fallback
+            
+            # Create a simple extractive summary
+            summary = "I'm having trouble generating a complete answer due to a timeout. Here's relevant information:\n\n"
+            context_for_display = []
+            
+            for i, doc in enumerate(context_docs[:4], 1):
+                snippet = (doc.get('content', '') or '')[:120].strip()  # Shorter snippets
+                summary += f"[{i}] From {doc.get('filename', 'Unknown')} (page {doc.get('page', 0)}): {snippet}\n\n"
+                context_for_display.append({
+                    "id": i,
+                    "filename": doc.get('filename', 'Unknown'),
+                    "page": doc.get('page', 0),
+                    "content": snippet
+                })
+            
+            return {
+                "answer": summary,
+                "context": context_for_display,
+                "documents_found": len(context_docs),
+                "citations": [],
+                "error": "The request to Ollama timed out. Try asking a simpler question or check if Ollama is running properly.",
+                "processing_time": round(time.time() - start_time, 2)
+            }
+        except Exception as fallback_error:
+            return {
+                "answer": "Error: Request to Ollama timed out. I couldn't generate a fallback response either. Please try again with a simpler question.",
+                "context": [],
+                "documents_found": 0,
+                "citations": [],
+                "error": f"Timeout: {str(e)}. Fallback error: {str(fallback_error)}",
+                "processing_time": round(time.time() - start_time, 2)
+            }
+    except requests.exceptions.ConnectionError as e:
+        print(f"[ERROR] Connection error in /ask endpoint: {e}")
+        return {
+            "answer": "Error: Could not connect to Ollama. Please check if Ollama is running and restart if necessary.",
+            "context": [],
+            "documents_found": 0,
+            "citations": [],
+            "error": "Connection error: Cannot connect to Ollama. Please check if Ollama is running and restart if necessary.",
+            "processing_time": round(time.time() - start_time, 2)
+        }
+    except Exception as e:
+        print(f"[ERROR] Error processing question: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        try:
+            # Get fewer documents for extractive summary using simple search
+            context_docs = simple_search(question, documents, top_k=4)  # Use simple search as fallback
+            
+            # Create a simple extractive summary
+            summary = "I encountered an error while processing your question, but here's relevant information:\n\n"
+            context_for_display = []
+            
+            for i, doc in enumerate(context_docs[:4], 1):
+                snippet = (doc.get('content', '') or '')[:120].strip()  # Shorter snippets
+                summary += f"[{i}] From {doc.get('filename', 'Unknown')} (page {doc.get('page', 0)}): {snippet}\n\n"
+                context_for_display.append({
+                    "id": i,
+                    "filename": doc.get('filename', 'Unknown'),
+                    "page": doc.get('page', 0),
+                    "content": snippet
+                })
+            
+            return {
+                "answer": summary,
+                "context": context_for_display,
+                "documents_found": len(context_docs),
+                "citations": [],
+                "error": f"Error processing your question: {str(e)}",
+                "processing_time": round(time.time() - start_time, 2)
+            }
+        except Exception as fallback_error:
+            return {
+                "error": f"Error processing your question: {str(e)}. Fallback error: {str(fallback_error)}",
+                "answer": "I encountered an error while processing your question. Please try again with a simpler question or check if Ollama is running properly.",
+                "context": [],
+                "documents_found": 0,
+                "citations": [],
+                "processing_time": round(time.time() - start_time, 2)
+            }
+
+@app.get('/search')
+def search(q: str, k_dense: int = 10, k_sparse: int = 10, k_final: int = 10, sparse_method: Optional[str] = None):
+    global SPARSE_METHOD
+    if sparse_method:
+        sm = sparse_method.lower()
+        if sm in ('bm25','tfidf') and sm != SPARSE_METHOD:
+            print(f"[INFO] Requested sparse_method={sm} differs from active={SPARSE_METHOD}; rebuilding on-the-fly")
+            SPARSE_METHOD = sm
+            _build_sparse_index()
+    if not q:
+        return {"error": "q required"}
+    dense_hits = _dense_search_internal(q, k_dense)
+    sparse_hits = _sparse_search(q, k_sparse)
+    fused = _rrf_fuse(dense_hits, sparse_hits, k_final*3) if (dense_hits or sparse_hits) else []
     return {
-        "answer": answer,
-        "context": context,
-        "documents_found": len(context_docs)
+        'query': q,
+        'sparse_method': SPARSE_METHOD,
+        'dense': dense_hits[:k_final],
+        'sparse': sparse_hits[:k_final],
+        'fused': fused[:k_final]
     }
 
 @app.get("/doc_stats")
@@ -753,6 +1657,71 @@ def ingest_status():
         "pages_reindexed": ingest_pages_reindexed,
         "percent": int(100 * ingest_processed_files / ingest_total_files) if ingest_total_files else 100
     }
+
+@app.get("/ingest_metrics")
+def ingest_metrics():
+    """Aggregate ingestion metrics from manifest."""
+    manifest = _load_manifest()
+    files = manifest.get('files', {})
+    total_files = len(files)
+    total_chunks = sum(f.get('num_chunks', 0) for f in files.values())
+    total_tables = sum(f.get('counts', {}).get('tables', 0) for f in files.values())
+    total_equations = sum(f.get('counts', {}).get('equations', 0) for f in files.values())
+    total_figures = sum(f.get('counts', {}).get('figures', 0) for f in files.values())
+    total_chars = sum(f.get('counts', {}).get('chars', 0) for f in files.values())
+    ocr_pages = sum(f.get('counts', {}).get('ocr_pages', 0) for f in files.values())
+    return {
+        "files": total_files,
+        "chunks": total_chunks,
+        "tables": total_tables,
+        "equations": total_equations,
+        "figures": total_figures,
+        "chars": total_chars,
+        "ocr_pages": ocr_pages,
+        "avg_chunks_per_file": (total_chunks/total_files) if total_files else 0,
+        "avg_chars_per_file": (total_chars/total_files) if total_files else 0
+    }
+
+@app.get("/doc_structure")
+def doc_structure(filename: str):
+    """Return headings (heading_path values) and table summaries for a file from vector store payloads."""
+    if embedder is None or qdrant_client is None:
+        return {"error": "Vector store unavailable"}
+    try:
+        # Query all points for filename (limit large to safeguard)
+        # Use scroll API via filter
+        filter_condition = qdrant_models.Filter(must=[qdrant_models.FieldCondition(key="filename", match=qdrant_models.MatchValue(value=filename))])
+        headings: Set[str] = set()
+        tables: List[Dict[str, Any]] = []
+        offset = None
+        batch_limit = 256
+        while True:
+            scroll_res = qdrant_client.scroll(collection_name=QDRANT_COLLECTION, scroll_filter=filter_condition, limit=batch_limit, with_payload=True, offset=offset)
+            points, offset = scroll_res
+            if not points:
+                break
+            for pt in points:
+                payload = pt.payload or {}
+                hp = payload.get('heading_path')
+                if hp:
+                    headings.add(hp)
+                if 'table_markdown' in payload:
+                    tables.append({
+                        'page': payload.get('page'),
+                        'chunk_index': payload.get('chunk_index'),
+                        'preview': (payload.get('table_markdown') or '')[:400]
+                    })
+            if offset is None:
+                break
+        return {
+            'filename': filename,
+            'headings': sorted(headings),
+            'tables': tables,
+            'table_count': len(tables)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # Endpoint to reindex a single file (force re-embed)
 @app.post("/reindex_file")
@@ -815,12 +1784,17 @@ def _structured_parse_pdf(fpath: str):
                     continue
                 avg_size = sum(s[1] for s in spans) / len(spans)
                 font_sizes.append(avg_size)
+                bbox = blk.get('bbox') if isinstance(blk, dict) else None
+                y_top = bbox[1] if bbox else None
+                x_left = bbox[0] if bbox else None  # new for refined ordering
                 page_blocks.append({
                     'page': page_index + 1,
                     'text': text_join,
                     'font_size': avg_size,
                     'type': 'paragraph',
-                    'heading_level': None
+                    'heading_level': None,
+                    'y_top': y_top,
+                    'x_left': x_left
                 })
             raw_pages_blocks.append(page_blocks)
         except Exception as pe:
@@ -855,25 +1829,66 @@ def _structured_parse_pdf(fpath: str):
                 for p_idx in range(min(len(pdf_tbl.pages), len(raw_pages_blocks))):
                     try:
                         page_obj = pdf_tbl.pages[p_idx]
-                        extracted_tables = page_obj.extract_tables() or []
-                        for t in extracted_tables:
-                            if not t or not any(any(cell and cell.strip() for cell in row) for row in t):
+                        # Use find_tables for bbox ordering
+                        found_tables = page_obj.find_tables() or []
+                        page_table_objs = []
+                        for tbl in found_tables:
+                            try:
+                                rows = [[(cell or '').strip() for cell in row] for row in tbl.extract()]  # type: ignore[attr-defined]
+                            except Exception:
                                 continue
-                            # Convert to markdown
-                            rows = [[(cell or '').strip() for cell in row] for row in t]
+                            if not rows or not any(any(cell for cell in r) for r in rows):
+                                continue
                             n_cols = max(len(r) for r in rows)
-                            # Pad rows
                             for r in rows:
                                 while len(r) < n_cols:
                                     r.append('')
-                            header = rows[0]
+                            # Summarize/truncate
+                            disp_rows = rows[:TABLE_SUMMARY_MAX_ROWS]
+                            truncated = len(rows) > TABLE_SUMMARY_MAX_ROWS
+                            if truncated:
+                                disp_rows.append(['…'] * n_cols)
+                            if n_cols > TABLE_SUMMARY_MAX_COLS:
+                                for r in disp_rows:
+                                    del r[TABLE_SUMMARY_MAX_COLS:]
+                                if disp_rows and disp_rows[0]:
+                                    disp_rows[0][-1] = (disp_rows[0][-1] or '') + '…'
+                            header = disp_rows[0]
                             md_lines = ['|' + '|'.join(c or ' ' for c in header) + '|']
-                            md_lines.append('|' + '|'.join(['---']*n_cols) + '|')
-                            for data_row in rows[1:]:
+                            md_lines.append('|' + '|'.join(['---']*len(header)) + '|')
+                            for data_row in disp_rows[1:]:
                                 md_lines.append('|' + '|'.join(c or ' ' for c in data_row) + '|')
                             table_markdown = '\n'.join(md_lines)
                             table_md5 = hashlib.md5(table_markdown.encode('utf-8')).hexdigest()
-                            tables_per_page[p_idx].append({
+                            # Basic numeric column stats for summary
+                            col_stats = []
+                            for col_idx in range(n_cols):
+                                col_vals_raw = [r[col_idx] for r in rows[1:80] if len(r) > col_idx]
+                                numeric_vals = []
+                                for v in col_vals_raw:
+                                    try:
+                                        numeric_vals.append(float(v.replace('%','').replace(',','')))
+                                    except Exception:
+                                        continue
+                                if numeric_vals:
+                                    col_stats.append(f"c{col_idx+1}:n={len(numeric_vals)} min={min(numeric_vals):.2f} max={max(numeric_vals):.2f}")
+                            table_summary_stats = '; '.join(col_stats[:4]) if col_stats else ''
+                            table_summary = f"rows={len(rows)} cols={n_cols} {'truncated ' if truncated else ''}{table_summary_stats}".strip()
+                            y_top = tbl.bbox[1] if getattr(tbl, 'bbox', None) else 0  # type: ignore
+                            x_left = tbl.bbox[0] if getattr(tbl, 'bbox', None) else 0  # type: ignore
+                            # Build CSV (full rows) and cap later when storing in payload
+                            csv_lines = []
+                            for r in rows:
+                                # simple CSV quoting
+                                csv_cells = []
+                                for cell in r:
+                                    cell = cell or ''
+                                    if any(ch in cell for ch in [',','"','\n']):
+                                        cell = '"' + cell.replace('"','""') + '"'
+                                    csv_cells.append(cell)
+                                csv_lines.append(','.join(csv_cells))
+                            table_csv_full = '\n'.join(csv_lines)
+                            page_table_objs.append((y_top, x_left, {
                                 'page': p_idx + 1,
                                 'text': table_markdown,
                                 'font_size': 0,
@@ -882,9 +1897,29 @@ def _structured_parse_pdf(fpath: str):
                                 'table_markdown': table_markdown,
                                 'n_rows': len(rows),
                                 'n_cols': n_cols,
-                                'table_md5': table_md5
-                            })
-                            tables_count += 1
+                                'table_md5': table_md5,
+                                'table_summary': table_summary,
+                                'table_csv': table_csv_full[:TABLE_CSV_MAX_CHARS],
+                                'y_top': y_top,
+                                'x_left': x_left
+                            }))
+                        if page_table_objs:
+                            text_blocks = raw_pages_blocks[p_idx]
+                            if any(b.get('y_top') is not None for b in text_blocks):
+                                combined = [
+                                    (
+                                        (b.get('y_top') if b.get('y_top') is not None else 9e9),
+                                        (b.get('x_left') if b.get('x_left') is not None else 9e9),
+                                        b
+                                    ) for b in text_blocks
+                                ]
+                                combined.extend(page_table_objs)  # already tuples (y_top,x_left,blk)
+                                combined.sort(key=lambda x: (x[0], x[1]))
+                                raw_pages_blocks[p_idx] = [b for _,__, b in combined]
+                            else:
+                                # Fallback: append at end preserving existing order
+                                for _,__, tbl_blk in page_table_objs:
+                                    raw_pages_blocks[p_idx].append(tbl_blk)
                     except Exception as tpe:
                         print(f"[WARNING] Table extraction failed on page {p_idx+1} {fpath}: {tpe}")
         except Exception as te:
@@ -952,10 +1987,18 @@ def _structure_aware_chunk(pages_blocks):
             return
         text = '\n'.join(b['text'] for b in chunk_blocks_accum)
         md5 = hashlib.md5(text.encode('utf-8')).hexdigest()
+        # Table metadata propagation (single table block case)
+        tbl_blocks = [b for b in chunk_blocks_accum if b['type'] == 'table']
+        if len(tbl_blocks) == 1 and len(chunk_blocks_accum) == 1:
+            tbl = tbl_blocks[0]
+       
+
+        else:
+            tbl = None
         pages = [b['page'] for b in chunk_blocks_accum]
         block_types = [b['type'] for b in chunk_blocks_accum]
         pages_sorted = sorted(set(pages))
-        chunks.append({
+        chunk_entry = {
             'page': min(pages_sorted),
             'pages': pages_sorted,
             'chunk_index': chunk_index_counter,
@@ -964,10 +2007,16 @@ def _structure_aware_chunk(pages_blocks):
             'heading_path': ' > '.join(heading_path),
             'block_types': block_types,
             'page_range': f"{min(pages_sorted)}-{max(pages_sorted)}" if len(pages_sorted)>1 else str(pages_sorted[0])
-        })
-        chunk_index_counter += 1
+        }
+        if tbl is not None:
+            # Carry table metadata
+            for k in ['table_md5','table_summary','table_csv','n_rows','n_cols']:
+                if k in tbl:
+                    chunk_entry[k] = tbl[k]
+        chunks.append(chunk_entry)
         chunk_blocks_accum = []
         chunk_tokens = 0
+        chunk_index_counter += 1
     for page_blocks in pages_blocks:
         for blk in page_blocks:
             # Update heading path
@@ -985,11 +2034,293 @@ def _structure_aware_chunk(pages_blocks):
             if chunk_tokens + blk_tokens > MAX_TOKENS or (chunk_tokens > 0 and chunk_tokens >= TARGET_TOKENS):
                 flush()
             chunk_blocks_accum.append(blk)
+           
             chunk_tokens += blk_tokens
     flush()
     return chunks
 
-if __name__ == "__main__":
+# ---------------- Diversity-aware Context Assembly ---------------- #
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text.split()))
+
+def assemble_context(question: str, hits: List[dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> List[dict]:
+    if not ENABLE_DIVERSITY:
+        # simple return
+        return hits
+    # Identify if question wants tables
+    q_lower = question.lower()
+    wants_tables = any(k in q_lower for k in TABLE_KEYWORDS)
+    by_heading: Dict[str, List[dict]] = {}
+    for h in hits:
+        hp = h.get('heading_path') or ''
+        by_heading.setdefault(hp, []).append(h)
+    ordered_headings = sorted(by_heading.keys())
+    assembled: List[dict] = []
+    used_tokens = 0
+    # Round-robin pick per heading
+    while ordered_headings and used_tokens < max_tokens:
+        new_ordered = []
+        for hp in ordered_headings:
+            bucket = by_heading[hp]
+            if not bucket:
+                continue
+            cand = bucket.pop(0)
+            # Skip table-heavy chunks unless requested
+            block_types = cand.get('block_types') or []
+            if not wants_tables and block_types == ['table'] and len(assembled) >= 2:
+                # push to end for later
+                bucket.append(cand)
+            else:
+                tks = _estimate_tokens(cand.get('content',''))
+                if used_tokens + tks <= max_tokens:
+                    assembled.append(cand)
+                    used_tokens += tks
+            if bucket:
+                new_ordered.append(hp)
+        if new_ordered == ordered_headings:  # no progress
+            break
+        ordered_headings = new_ordered
+    return assembled
+# ---------------- End Diversity-aware Context Assembly ---------------- #
+
+# ---------------- New: Answer generation with citation markers ---------------- #
+
+def generate_answer_with_citations(question: str, context_docs: List[dict]) -> tuple[str, List[dict]]:
+    if not context_docs:
+        return ("I couldn't find relevant information to answer your question.", [])
+    
+    # Assign citation ids if not already
+    for idx, d in enumerate(context_docs, start=1):
+        d['citation_id'] = idx
+    
+    # Optimize context by limiting the number of documents and snippet length
+    # This reduces the prompt size and processing time
+    max_docs = min(len(context_docs), 6)  # Reduced from 8 to 6 most relevant documents
+    snippet_length = 250  # Initial snippet length, reduced from 300
+    
+    # Adaptive timeout and retry mechanism
+    max_retries = 3
+    initial_timeout = 90  # Initial timeout in seconds
+    min_timeout = 30  # Minimum timeout for subsequent retries
+    timeout_reduction_factor = 0.7  # Reduce timeout by 30% on each retry
+    
+    # Track timeouts to reduce context size on multiple timeouts
+    timeout_count = 0
+    
+    for attempt in range(max_retries + 1):
+        # Adjust context size if we've had multiple timeouts
+        current_max_docs = max(3, max_docs - timeout_count)  # Reduce docs but keep at least 3
+        current_snippet_length = max(150, snippet_length - (timeout_count * 50))  # Reduce snippet length but keep at least 150 chars
+        
+        # Build context with current parameters
+        context_lines = []
+        for d in context_docs[:current_max_docs]:
+            snippet = (d.get('content','') or '')[:current_snippet_length].strip()
+            context_lines.append(f"[C{d['citation_id']}] Source: {d.get('filename')} page {d.get('page')} chunk {d.get('chunk_index')}\n{snippet}")
+        
+        context_text = '\n\n'.join(context_lines)
+        
+        # Streamlined instructions to reduce prompt size
+        instructions = (
+            "You are an academic assistant. Use ONLY the provided context. "
+            "Cite facts with [C1], [C2], etc. Include References section at the end. Be concise."
+        )
+        
+        prompt = f"{instructions}\n\nQuestion: {question}\n\nContext:\n{context_text}\n\nAnswer:"
+        
+        # Calculate current timeout (reduce on each retry)
+        current_timeout = max(min_timeout, initial_timeout * (timeout_reduction_factor ** attempt))
+        
+        print(f"[INFO] Attempt {attempt+1}/{max_retries+1}: Using {current_max_docs} docs, {current_snippet_length} chars per snippet, {current_timeout:.1f}s timeout")
+        
+        try:
+            print(f"[INFO] Sending request to Ollama (attempt {attempt+1}/{max_retries+1})")
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": "llama3:latest", 
+                    "prompt": prompt, 
+                    "stream": False,
+                    "temperature": 0.7
+                },
+                timeout=current_timeout
+            )
+            response.raise_for_status()
+            data = response.json()
+            answer = data.get('response', '')
+            
+            # Check for empty response
+            if not answer.strip():
+                print(f"[WARNING] Empty response received on attempt {attempt+1}")
+                if attempt < max_retries:
+                    timeout_count += 1  # Treat empty response like a timeout
+                    wait_time = (attempt + 1) * 2
+                    print(f"[INFO] Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return "Error: Received empty response from Ollama. Please try again with a simpler question.", []
+            
+            print(f"[INFO] Ollama response received successfully on attempt {attempt+1}")
+            break  # Success, exit retry loop
+            
+        except requests.exceptions.Timeout as e:
+            print(f"[WARNING] Timeout on attempt {attempt+1}/{max_retries+1}: {e}")
+            timeout_count += 1
+            
+            if attempt < max_retries:
+                # Wait before retrying, with increasing backoff
+                wait_time = (attempt + 1) * 2
+                print(f"[INFO] Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            else:
+                answer = f"Error: Request to Ollama timed out after {max_retries+1} attempts. Try asking a simpler question or check if Ollama is running properly."
+                
+        except requests.exceptions.ConnectionError as e:
+            print(f"[ERROR] Connection error on attempt {attempt+1}: {e}")
+            if attempt < max_retries:
+                wait_time = (attempt + 1) * 3  # Longer wait for connection issues
+                print(f"[INFO] Connection issue - waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+            else:
+                answer = f"Error: Cannot connect to Ollama. Please check if Ollama is running and restart if necessary."
+                
+        except Exception as e:
+            print(f"[ERROR] Failed on attempt {attempt+1}/{max_retries+1}: {e}")
+            if attempt < max_retries:
+                wait_time = (attempt + 1) * 2
+                print(f"[INFO] Waiting {wait_time} seconds before retry due to error: {e}")
+                time.sleep(wait_time)
+                timeout_count += 1  # Reduce context on next attempt
+            else:
+                answer = f"Error communicating with Ollama: {str(e)}. Please try again or check if Ollama is running properly."
+                break
+    
+    # Extract error message if present for better user feedback
+    error_msg = None
+    if answer.lower().startswith("error:"):
+        parts = answer.split(".", 1)
+        if len(parts) > 1:
+            error_msg = parts[0].strip() + "."
+            answer = parts[1].strip()
+    
+    citations = [
+        {
+            'id': d['citation_id'],
+            'filename': d.get('filename'),
+            'page': d.get('page'),
+            'chunk_index': d.get('chunk_index')
+        } for d in context_docs[:current_max_docs]  # Only include citations for docs actually used
+    ]
+    
+    return answer, citations
+# ---------------- End: Answer generation with citation markers ---------------- #
+
+@app.get('/tables')
+def list_tables(filename: Optional[str] = None, limit: int = 200):
+    """List table chunks (single-table chunks with table_markdown). Optional filter by filename."""
+    if embedder is None or qdrant_client is None:
+        return {"error": "Vector store unavailable"}
+    try:
+        must = []
+        if filename:
+            must.append(qdrant_models.FieldCondition(key="filename", match=qdrant_models.MatchValue(value=filename)))
+        filt = qdrant_models.Filter(must=must) if must else None
+        tables = []
+        offset = None
+        batch_limit = 256
+        while len(tables) < limit:
+            points, offset = qdrant_client.scroll(collection_name=QDRANT_COLLECTION, scroll_filter=filt, limit=batch_limit, with_payload=True, offset=offset)
+            if not points:
+                break
+            for pt in points:
+                payload = pt.payload or {}
+                if 'table_markdown' in payload:
+                    tables.append({
+                        'id': str(pt.id),
+                        'filename': payload.get('filename'),
+                        'page': payload.get('page'),
+                        'chunk_index': payload.get('chunk_index'),
+                        'table_md5': payload.get('table_md5'),
+                        'n_rows': payload.get('n_rows'),
+                        'n_cols': payload.get('n_cols'),
+                        'table_summary': payload.get('table_summary'),
+                        'preview': (payload.get('table_markdown') or '')[:250]
+                    })
+                    if len(tables) >= limit:
+                        break
+            if offset is None or len(tables) >= limit:
+                break
+        return {'count': len(tables), 'tables': tables, 'filename': filename}
+    except Exception as e:
+        return {'error': str(e)}
+
+@app.get('/table_csv')
+def get_table_csv(table_md5: Optional[str] = None, filename: Optional[str] = None, page: Optional[int] = None, chunk_index: Optional[int] = None):
+    """Return CSV + markdown for a specific table. Identify via table_md5 OR (filename,page,chunk_index)."""
+    if embedder is None or qdrant_client is None:
+        return {"error": "Vector store unavailable"}
+    if not table_md5 and not (filename and page is not None and chunk_index is not None):
+        return {"error": "Provide table_md5 or (filename,page,chunk_index)"}
+    try:
+        # Strategy: scroll (filtered by filename if provided) and match conditions client-side.
+        must = []
+        if filename:
+            must.append(qdrant_models.FieldCondition(key="filename", match=qdrant_models.MatchValue(value=filename)))
+        filt = qdrant_models.Filter(must=must) if must else None
+        offset = None
+        batch_limit = 256
+        while True:
+            points, offset = qdrant_client.scroll(collection_name=QDRANT_COLLECTION, scroll_filter=filt, limit=batch_limit, with_payload=True, offset=offset)
+            if not points:
+                break
+            for pt in points:
+                payload = pt.payload or {}
+                if 'table_markdown' not in payload:
+                    continue
+                if table_md5 and payload.get('table_md5') != table_md5:
+                    continue
+                if not table_md5 and filename and (payload.get('page') != page or payload.get('chunk_index') != chunk_index):
+                    continue
+                if not table_md5 and not filename:
+                    continue
+                return {
+                    'id': str(pt.id),
+                    'filename': payload.get('filename'),
+                    'page': payload.get('page'),
+                    'chunk_index': payload.get('chunk_index'),
+                    'table_md5': payload.get('table_md5'),
+                    'n_rows': payload.get('n_rows'),
+                    'n_cols': payload.get('n_cols'),
+                    'table_summary': payload.get('table_summary'),
+                    'table_markdown': payload.get('table_markdown'),
+                    'table_csv': payload.get('table_csv')
+                }
+            if offset is None:
+                break
+        return {'error': 'Table not found'}
+    except Exception as e:
+        return {'error': str(e)}
+
+
+if __name__ == '__main__':
     import uvicorn
-    # Run the FastAPI app if executed directly
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import socket
+    host = os.environ.get('HOST', '0.0.0.0')
+    port = int(os.environ.get('PORT', '8000'))
+    reload_flag = os.environ.get('RELOAD','1')=='1'
+    # Auto-disable reload if using embedded Qdrant path to avoid lock contention
+    if reload_flag and FORCE_DISABLE_RELOAD_FOR_EMBEDDED and not os.environ.get('QDRANT_URL'):
+        print('[INFO] Auto-disabling uvicorn reload because embedded Qdrant does not support multi-process access. Set FORCE_DISABLE_RELOAD_FOR_EMBEDDED=0 to override.')
+        reload_flag = False
+    # Port availability check (Windows)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        sock.close()
+    except OSError as e:
+        print(f'[ERROR] Port {port} is already in use. Please stop any other server using this port and try again.')
+        import sys
+        sys.exit(1)
+    uvicorn.run('main:app', host=host, port=port, reload=reload_flag)

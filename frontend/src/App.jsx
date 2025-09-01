@@ -48,26 +48,55 @@ function App() {
     setQuestion("");
 
     try {
+      // Set a longer timeout for the fetch request
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout
+      
       const res = await fetch("http://localhost:8000/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
+        signal: controller.signal
       });
+      
+      clearTimeout(timeoutId);
+      
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}));
+        throw new Error(errorData.error || `Server error: ${res.status}`);
+      }
+      
       const data = await res.json();
       
       const aiMessage = {
         type: "ai",
         content: data.answer,
         context: data.context,
-        documentsFound: data.documents_found
+        documentsFound: data.documents_found,
+        processingTime: data.processing_time,
+        citations: data.citations
       };
       
       setHistory(prev => [...prev, aiMessage]);
     } catch (error) {
+      console.error("Error during question processing:", error);
+      
+      let errorContent = "Sorry, I couldn't process your question. Please try again.";
+      
+      // Provide more specific error messages based on the error type
+      if (error.name === "AbortError") {
+        errorContent = "The request took too long to complete. This might be due to high server load or a complex question. Please try again or simplify your question.";
+      } else if (error.message && error.message.includes("Ollama")) {
+        errorContent = `Error communicating with the AI model: ${error.message}. Please ensure Ollama is running properly.`;
+      } else if (!navigator.onLine) {
+        errorContent = "You appear to be offline. Please check your internet connection and try again.";
+      }
+      
       const errorMessage = {
         type: "error",
-        content: "Sorry, I couldn't process your question. Please try again."
+        content: errorContent
       };
+      
       setHistory(prev => [...prev, errorMessage]);
     }
     
@@ -166,6 +195,11 @@ function App() {
                   <div className="message-avatar ai-avatar">🤖</div>
                   <div className="message-text ai-text">
                     <div className="ai-response">{item.content}</div>
+                    {item.processingTime && (
+                      <div className="processing-time">
+                        ⏱️ Response time: {item.processingTime}s
+                      </div>
+                    )}
                     {item.context && item.context.length > 0 && (
                       <div className="context-section">
                         <div className="context-header">
@@ -175,10 +209,10 @@ function App() {
                           {item.context.map((ctx, i) => (
                             <div key={i} className="context-item">
                               <div className="context-filename">
-                                📄 {ctx.split(':')[0]}
+                                📄 {ctx.filename} {ctx.page ? `(page ${ctx.page})` : ''}
                               </div>
                               <div className="context-preview">
-                                {ctx.substring(ctx.indexOf(':') + 1).trim()}
+                                {ctx.content}
                               </div>
                             </div>
                           ))}
@@ -192,7 +226,20 @@ function App() {
               {item.type === "error" && (
                 <div className="message-content">
                   <div className="message-avatar error-avatar">❌</div>
-                  <div className="message-text error-text">{item.content}</div>
+                  <div className="message-text error-text">
+                    <div>{item.content}</div>
+                    {item.content.includes("Ollama") && (
+                      <div className="error-help-text">
+                        <p><strong>Troubleshooting tips:</strong></p>
+                        <ul>
+                          <li>Ensure Ollama is running on your system</li>
+                          <li>Try restarting the Ollama service</li>
+                          <li>Check if the model is properly loaded in Ollama</li>
+                          <li>For complex questions, try breaking them into smaller parts</li>
+                        </ul>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
             </div>

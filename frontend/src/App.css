@@ -222,9 +222,40 @@ body {
   border: 2px solid #fecaca;
 }
 
+.error-help-text {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #fecaca;
+  font-size: 0.9rem;
+}
+
+.error-help-text p {
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.error-help-text ul {
+  padding-left: 20px;
+  margin-bottom: 8px;
+}
+
+.error-help-text li {
+  margin-bottom: 4px;
+}
+
 .ai-response {
-  margin-bottom: 20px;
+  margin-bottom: 10px;
   white-space: pre-wrap;
+}
+
+.processing-time {
+  font-size: 0.8rem;
+  color: #6b7280;
+  margin-bottom: 10px;
+  padding: 4px 8px;
+  background-color: #f3f4f6;
+  border-radius: 4px;
+  display: inline-block;
 }
 
 /* Context Section */

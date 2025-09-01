@@ -57,7 +57,7 @@ Preferred extraction sources:
 - pdfplumber (extract table -> 2D list)
 Normalize -> Markdown grid table and CSV string
 Payload for table blocks: {table_markdown, table_csv, n_rows, n_cols, table_md5}
-(Status: Not implemented yet.)
+(Status: Basic implemented – pdfplumber tables extracted via find_tables(), ordered by bbox top (approximate), normalized to markdown with row/col truncation + added n_rows, n_cols, table_md5, table_summary. CSV export still pending; advanced ordering using text block bboxes pending.)
 
 ## 6. Equations & Figures (Optional Phase 4/5)
 - Equation blocks: LaTeX text or placeholder [EQUATION]
@@ -112,7 +112,7 @@ Payload add:
   coverage_ratio
 }
 ```
-(Current: Added heading_path, block_types, schema_version, page_range in payload. Others pending.)
+(Current: Added heading_path, block_types, schema_version, page_range, table_markdown (single-table chunks), table_summary (heuristic). TF-IDF sparse index built in-memory; pending: persistence & BM25 variant.)
 
 ## 10. Reranking & Context Assembly
 Retrieval Steps:
@@ -124,7 +124,7 @@ Retrieval Steps:
    - Prioritize diversity (distinct heading_path)
    - Collapse sequential chunks from same section
    - Convert tables to concise markdown with row/col limits + ellipsis
-(Status: Not started.)
+(Status: Partial – Dense + TF-IDF sparse + RRF fusion implemented; optional cross-encoder rerank (env ENABLE_RERANK) integrated. Diversity-aware context assembly & advanced table condensation still pending.)
 
 ## 11. Answer Prompt Enrichment
 Prompt sections:
@@ -159,15 +159,26 @@ Expose /ingest_metrics endpoint.
 
 ### Phase 2 (Tables + Manifest Upgrade)
 - [x] Table extraction (basic pdfplumber integration; ordering simplistic)
-- [ ] Add table_markdown to payload (partial: included for pure table chunks)
-- [x] Manifest: schema_version, page_md5 list (IN PROGRESS: completed for page objects) add per-page num_blocks (done Phase 1)
+- [x] Add table_markdown to payload (for pure table chunks)
+- [x] Manifest: schema_version, page_md5 list (completed for page objects) add per-page num_blocks
 - [x] Selective page reindex (implemented Phase 1)
 - [x] Manifest counts.tables populated (equations/figures pending)
+- [x] Throttled PyPDF2 warnings + per-page pdfplumber fallback
+- [x] FAST_SKIP_PDF_REPARSE flag to avoid re-parsing unchanged PDFs
+- [x] Table ordering by bbox (basic via pdfplumber find_tables; refine with text block bboxes pending)
+- [x] Table summarization (row/col truncation + basic numeric column stats; advanced semantic summary pending)
 
 ### Phase 3 (Hybrid Retrieval + Rerank)
-- [ ] Add sparse index (BM25 or TF-IDF) persisted (e.g. SQLite/Whoosh)
-- [ ] Implement RRF fusion
-- [ ] Integrate cross-encoder reranking (optional env flag)
+- [x] Add sparse index (TF-IDF) in-memory (persistence & BM25 variant pending)
+- [x] Implement RRF fusion
+- [x] Integrate cross-encoder reranking (optional env flag)
+- [x] Add diversity-aware context assembly prototype (basic round-robin implemented; advanced citation & dedupe pending)
+- [x] Persist sparse artifacts (vectorizer, matrix, refs) across restarts (ENV ENABLE_SPARSE_PERSIST)
+- [x] BM25 / alternative sparse scorer (custom BM25 implementation with persistence)
+- [x] Rerank caching (LRU for (query_md5, chunk_md5))
+- [x] Citation IDs and inline markers in /ask responses
+- [x] /tables and /table_csv endpoints for table chunk export and inspection
+- [x] Qdrant client initialization robustness (retry logic, null checks for uvicorn reload)
 
 ### Phase 4 (OCR & Low Coverage Recovery)
 - [ ] PaddleOCR for low-text pages
@@ -180,13 +191,16 @@ Expose /ingest_metrics endpoint.
 
 ### Phase 6 (Advanced Context Assembly + Citations)
 - [ ] Diversity-aware context selection
-- [ ] Table summarization (truncate large tables)
+- [ ] Table summarization (truncate large tables) (basic stats done; advanced semantic summarization pending)
 - [ ] Inline citation markers, structured citations list
 
 ### Phase 7 (Quality & Ops)
-- [ ] /ingest_metrics endpoint
-- [ ] Export/import script (points + manifest) (Partial: point export/import scripts exist, no manifest yet)
-- [ ] Stress tests & regression harness with sample academic PDFs
+- [x] /ingest_metrics endpoint
+- [ ] Export/import script include manifest (currently only vectors)
+- [x] /doc_structure endpoint (headings + tables summary)
+- [ ] Logging enrichment (structured JSON option)
+- [ ] API key / rate limiting
+- [ ] Sparse index persistence
 
 ## 14. Data Structures (Draft)
 ```
@@ -210,8 +224,11 @@ Manifest:
 
 ## 15. New/Updated Endpoints
 - POST /reindex_file (exists) – extend to accept force=true to ignore checksum (Pending)
-- GET /ingest_metrics – summary JSON (Pending)
-- GET /doc_structure?filename= – returns headings & table summary (Pending)
+- GET /ingest_metrics – summary JSON (Implemented)
+- GET /doc_structure?filename= – returns headings & table summary (Implemented)
+- GET /search – expose dense/sparse/fused scores for debugging (Implemented)
+- (Planned) GET /table_csv – return CSV for a table chunk
+- (Planned) GET /tables?filename= – list all tables with stats
 
 ## 16. Configuration Flags (ENV)
 - ENABLE_PYMUPDF=1
@@ -250,11 +267,24 @@ Phase 3/4 optional: cross-encoder (sentence-transformers already supports) model
 - Section-aware answer grounding (return section_id with answer spans)
 - Feedback loop: log user question + retrieved chunks + rating to improve reranking
 - Knowledge graph extraction (entities / relations) augment retrieval for concept queries
+- Table CSV export & advanced semantic summarization
+- BM25 scorer + hybrid fusion ablation metrics
+- Inline citation markers with numbered references in answers
+- Rerank score caching & configurable top-N rerank
+- Structured logging (JSON) & /metrics Prometheus endpoint
+- API key auth + rate limiting
+- Export/import full corpus (vectors + manifest + sparse index + checksums)
 
 ---
-Additional Notes (Phase 1 Completion Increment):
+Additional Notes (Phase 1 + Phase 2/3 Progress):
 - SCHEMA_VERSION bumped to 3.
-- Manifest now stores: pages[{page,page_md5,num_blocks,ocr}], header_patterns, footer_patterns, block_index_hash, counts{{tables,equations,figures,ocr_pages,chars}}.
-- Partial reindex deletes only vectors for changed pages (tracked via ingest_status pages_reindexed metric).
-- Basic normalization implemented; future enhancements: language detection, semantic block tagging, overlap tuning.
-- Basic table extraction added (pdfplumber) with table markdown embedded when chunk is a single table.
+- Manifest stores per-page metadata, header/footer patterns, block_index_hash, counts.
+- Table pipeline: bbox-ordered extraction, markdown normalization, truncation, numeric column stats -> table_summary.
+- Hybrid retrieval: Dense + TF-IDF sparse + RRF; optional cross-encoder rerank (ENABLE_RERANK=1). Sparse persistence implemented.
+- Diversity-aware context assembly implemented (round-robin by heading, table suppression heuristic) – advanced citation/dedupe pending.
+- BM25 scorer implemented with persistence and /search endpoint parameter switching.
+- Citation IDs and inline markers implemented in /ask responses with reference listing.
+- Rerank caching (LRU) and configurable top-N rerank implemented.
+- /tables and /table_csv endpoints implemented for table chunk export and inspection.
+- Qdrant client initialization improved with retry logic and comprehensive null checks to handle uvicorn reload scenarios.
+- Next priority: (a) table ordering refinement with x/y coordinates, (b) logging enrichment & /metrics, (c) API key auth, (d) export/import tooling, (e) OCR fallback for low-text pages.

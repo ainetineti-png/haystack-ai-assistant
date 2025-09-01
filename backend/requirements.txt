@@ -11,3 +11,7 @@ portalocker
 haystack-ai
 qdrant-haystack
 pymupdf  # Phase 1 structured PDF parsing
+scikit-learn  # Sparse BM25/TF-IDF (TF-IDF first)
+scipy  # Needed by scikit-learn
+numpy  # Explicit pin for consistency
+rank-bm25  # BM25 scoring
