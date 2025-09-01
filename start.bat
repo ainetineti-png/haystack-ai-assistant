@@ -1,15 +1,23 @@
 @echo off
-echo Starting Ollama RAG Application...
+echo ========================================
+echo HayStack RAG - Development Startup
+echo ========================================
+echo.
 
-REM Activate virtual environment
-if exist "venv\Scripts\activate.bat" (
-    echo Activating virtual environment...
-    call venv\Scripts\activate.bat
-) else (
-    echo Warning: Virtual environment not found at venv\Scripts\activate.bat
+REM Check if virtual environment exists
+if not exist "venv\Scripts\activate.bat" (
+    echo Error: Virtual environment not found!
+    echo Please run setup_env.bat first to create the environment.
+    pause
+    exit /b 1
 )
 
-REM Start Ollama (if not running)
+REM Activate virtual environment
+echo Activating virtual environment...
+call venv\Scripts\activate.bat
+
+REM Check if Ollama is running
+echo Checking Ollama status...
 tasklist /FI "IMAGENAME eq ollama.exe" | find /I "ollama.exe" >nul
 if errorlevel 1 (
     echo Starting Ollama...
@@ -20,12 +28,17 @@ if errorlevel 1 (
     echo Ollama is already running.
 )
 
-REM Test Ollama connection
-echo Testing Ollama connection...
-timeout /t 2 >nul
+REM Check if llama3 model is available
+echo Checking Llama3 model...
+ollama list | findstr /I "llama3" >nul
+if errorlevel 1 (
+    echo Warning: Llama3 model not found!
+    echo Please run: ollama pull llama3
+    echo.
+)
 
-REM Start FastAPI backend with venv
-echo Starting backend...
+REM Start FastAPI backend
+echo Starting backend server...
 cd backend
 start "Backend" cmd /k "cd /d %CD% && ..\venv\Scripts\activate.bat && python main.py"
 cd ..
@@ -36,4 +49,14 @@ cd frontend
 start "Frontend" cmd /k "npm start"
 cd ..
 
-echo All services started. Check terminal windows for any errors.
+echo.
+echo ========================================
+echo All services started!
+echo ========================================
+echo.
+echo Backend: http://localhost:8000
+echo Frontend: http://localhost:3000
+echo.
+echo Check terminal windows for any errors.
+echo Press any key to close this window...
+pause >nul

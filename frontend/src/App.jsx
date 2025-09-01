@@ -6,6 +6,8 @@ function App() {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
   const [statusMsg, setStatusMsg] = useState("");
+  const [ingestProgress, setIngestProgress] = useState(null);
+  const [ingesting, setIngesting] = useState(false);
   const chatEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -15,6 +17,27 @@ function App() {
   useEffect(() => {
     scrollToBottom();
   }, [history]);
+
+  // Poll backend for ingest status
+  useEffect(() => {
+    let poller;
+    if (ingesting) {
+      poller = setInterval(async () => {
+        try {
+          const res = await fetch("http://localhost:8000/ingest_status");
+          const data = await res.json();
+          setIngestProgress(data);
+          if (data.percent >= 100) {
+            setIngesting(false);
+            setTimeout(() => setIngestProgress(null), 2000);
+          }
+        } catch (err) {
+          setIngestProgress(null);
+        }
+      }, 500);
+    }
+    return () => poller && clearInterval(poller);
+  }, [ingesting]);
 
   const askQuestion = async () => {
     if (!question.trim()) return;
@@ -60,6 +83,8 @@ function App() {
 
   const reloadAllDocs = async () => {
     setStatusMsg("Reloading all documents...");
+    setIngesting(true);
+    setIngestProgress({ total: 0, processed: 0, percent: 0 });
     try {
       const res = await fetch("http://localhost:8000/ingest");
       const data = await res.json();
@@ -73,6 +98,8 @@ function App() {
 
   const incrementalIndex = async () => {
     setStatusMsg("Incremental indexing...");
+    setIngesting(true);
+    setIngestProgress({ total: 0, processed: 0, percent: 0 });
     try {
       const res = await fetch("http://localhost:8000/ingest_incremental");
       const data = await res.json();
@@ -92,10 +119,20 @@ function App() {
           <h1>🤖 AI Knowledge Assistant</h1>
           <p>Ask me anything about your documents</p>
           <div style={{ marginTop: 10 }}>
-            <button onClick={reloadAllDocs} className="reload-btn">Reload All Docs</button>
-            <button onClick={incrementalIndex} className="reload-btn" style={{ marginLeft: 8 }}>Incremental Index</button>
+            <button onClick={reloadAllDocs} className="reload-btn" disabled={ingesting}>Reload All Docs</button>
+            <button onClick={incrementalIndex} className="reload-btn" style={{ marginLeft: 8 }} disabled={ingesting}>Incremental Index</button>
           </div>
           {statusMsg && <div className="status-msg">{statusMsg}</div>}
+          {ingestProgress && (
+            <div className="ingest-progress-bar" style={{ marginTop: 10 }}>
+              <div style={{ width: "100%", background: "#eee", borderRadius: 6, height: 18 }}>
+                <div style={{ width: `${ingestProgress.percent}%`, background: "#4caf50", height: 18, borderRadius: 6, transition: "width 0.3s" }}></div>
+              </div>
+              <div style={{ fontSize: 13, marginTop: 2 }}>
+                {ingestProgress.processed} / {ingestProgress.total} files processed ({ingestProgress.percent}%)
+              </div>
+            </div>
+          )}
         </div>
       </div>
 

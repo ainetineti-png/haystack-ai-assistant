@@ -1,45 +1,53 @@
-# Haystack RAG Chat App
+# HayStack RAG Application
 
-## Backend (FastAPI + Simple RAG)
-1. Create and activate virtual environment:
-   ```pwsh
-   python -m venv venv
-   venv\Scripts\activate
-   ```
-2. Install dependencies:
-   ```pwsh
-   cd backend
-   pip install fastapi uvicorn
-   ```
-3. Add your text files to `./backend/data/`.
-4. Run the backend:
-   ```pwsh
-   cd backend
-   C:/HayStack/venv/Scripts/python.exe -m uvicorn main:app --reload --host 127.0.0.1 --port 8001
-   ```
+A Retrieval-Augmented Generation (RAG) application built with FastAPI, React, and Ollama.
 
-## Frontend (React)
-1. Install dependencies:
-   ```pwsh
-   cd frontend
-   npm install
-   ```
-2. Start the frontend:
-   ```pwsh
-   npm start
-   ```
+## 🚀 Quick Start
 
-## Quick Start
-- Double-click `start.bat` to run both backend and frontend automatically
-- Double-click `stop.bat` to stop both services
+1. **Install Python 3.11+**
+2. **Run `setup_env.bat`** to create virtual environment
+3. **Install Ollama** from https://ollama.ai/
+4. **Download model**: `ollama pull llama3`
+5. **Run `start.bat`** to launch the application
 
-## Usage
-- Backend runs on: http://127.0.0.1:8001
-- Frontend runs on: http://localhost:3000 (usually)
-- Ask questions in the chatbox. The AI answer and retrieved context will be shown for accuracy verification.
-- To reload documents, call `GET http://127.0.0.1:8001/ingest`
+## 📁 Project Structure
 
-## Notes
-- No document upload: only parses files from `./backend/data/` at startup or via `/ingest`.
-- Uses simple keyword-based search (can be upgraded to BM25/embeddings later).
-- Context is always displayed below the AI answer for verification.
+```
+HayStack/
+├── backend/                 # FastAPI backend
+│   ├── main.py            # Main application
+│   ├── requirements.txt   # Python dependencies
+│   ├── data/              # Document storage
+│   ├── qdrant_storage/    # Vector database
+│   └── scripts/           # Utility scripts
+├── frontend/               # React frontend
+├── models/                 # AI models
+├── venv/                   # Python virtual environment
+├── start.bat               # Development startup script
+├── setup_env.bat           # Environment setup script
+└── package_for_windows.bat # Windows EXE packaging
+```
+
+## 🛠️ Development
+
+- **Backend**: FastAPI with Qdrant vector search
+- **Frontend**: React with chat interface
+- **AI**: Ollama + Llama3 for answer generation
+- **Embeddings**: Sentence transformers for document vectors
+
+## 📦 Deployment
+
+- **Development**: Use `start.bat` for local development
+- **Production**: Use `package_for_windows.bat` to create portable EXE
+- **Portable**: Export/import embeddings without re-parsing PDFs
+
+## 🔧 Scripts
+
+- `setup_env.bat` - Creates Python environment and installs dependencies
+- `start.bat` - Starts backend and frontend development servers
+- `package_for_windows.bat` - Creates Windows EXE distribution package
+
+## 📚 Documentation
+
+- `backend/README_DEPLOYMENT.md` - Detailed deployment guide
+- `backend/scripts/` - Export/import scripts for embeddings
