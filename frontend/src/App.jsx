@@ -5,6 +5,7 @@ function App() {
   const [question, setQuestion] = useState("");
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(false);
+  const [statusMsg, setStatusMsg] = useState("");
   const chatEndRef = useRef(null);
 
   const scrollToBottom = () => {
@@ -57,6 +58,32 @@ function App() {
     }
   };
 
+  const reloadAllDocs = async () => {
+    setStatusMsg("Reloading all documents...");
+    try {
+      const res = await fetch("http://localhost:8000/ingest");
+      const data = await res.json();
+      setStatusMsg(`Reloaded: ${data.documents_loaded} documents.`);
+      setTimeout(() => setStatusMsg(""), 3000);
+    } catch (err) {
+      setStatusMsg("Error reloading documents.");
+      setTimeout(() => setStatusMsg(""), 3000);
+    }
+  };
+
+  const incrementalIndex = async () => {
+    setStatusMsg("Incremental indexing...");
+    try {
+      const res = await fetch("http://localhost:8000/ingest_incremental");
+      const data = await res.json();
+      setStatusMsg(`Indexed: ${data.new_documents} new, total: ${data.total_documents} documents.`);
+      setTimeout(() => setStatusMsg(""), 3000);
+    } catch (err) {
+      setStatusMsg("Error with incremental indexing.");
+      setTimeout(() => setStatusMsg(""), 3000);
+    }
+  };
+
   return (
     <div className="app">
       {/* Header */}
@@ -64,6 +91,11 @@ function App() {
         <div className="header-content">
           <h1>🤖 AI Knowledge Assistant</h1>
           <p>Ask me anything about your documents</p>
+          <div style={{ marginTop: 10 }}>
+            <button onClick={reloadAllDocs} className="reload-btn">Reload All Docs</button>
+            <button onClick={incrementalIndex} className="reload-btn" style={{ marginLeft: 8 }}>Incremental Index</button>
+          </div>
+          {statusMsg && <div className="status-msg">{statusMsg}</div>}
         </div>
       </div>
 

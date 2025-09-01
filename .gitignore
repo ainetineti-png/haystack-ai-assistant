@@ -30,7 +30,7 @@ env.bak/
 venv.bak/
 
 # Data files (exclude actual documents for privacy)
-backend/data/*.txt
+backend/data/
 !backend/data/README.md
 
 # IDEs

@@ -20,16 +20,6 @@ if errorlevel 1 (
     echo Ollama is already running.
 )
 
-REM Check if Llama3 model is available
-echo Checking for Llama3 model...
-ollama list | findstr /I "llama3" >nul
-if errorlevel 1 (
-    echo Pulling Llama3 model... (this may take a while)
-    ollama pull llama3
-) else (
-    echo Llama3 model already available.
-)
-
 REM Test Ollama connection
 echo Testing Ollama connection...
 timeout /t 2 >nul

@@ -1,7 +1,12 @@
 fastapi
 uvicorn
-haystack-ai
-sentence-transformers
-transformers
-ollama-haystack
 requests
+python-docx
+pdfplumber
+PyPDF2
+qdrant-client
+sentence-transformers
+torch
+portalocker
+haystack-ai
+qdrant-haystack
