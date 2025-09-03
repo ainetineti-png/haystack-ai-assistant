@@ -15,12 +15,19 @@ import atexit  # Safe shutdown handler
 import unicodedata  # For block normalization
 import statistics  # For table summarization stats
 from collections import OrderedDict  # Added for rerank LRU cache
+from collections import deque  # NEW: for conversation history
+import re  # Added for prompt / citation post-processing
 # Removed LangExtract import - no longer needed
 from qdrant_client import QdrantClient, models as qdrant_models
 from sentence_transformers import SentenceTransformer
 import sys
 from pathlib import Path
 import time  # For timing operations
+from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+from pydantic import BaseModel
 
 # Load environment variables from config.env if it exists
 def load_env_from_file(env_file):
@@ -492,7 +499,7 @@ def _dense_search_internal(query: str, top_k: int) -> List[dict]:
                 'filename': payload.get('filename'),
                 'page': payload.get('page'),
                 'chunk_index': payload.get('chunk_index'),
-                'heading_path': payload.get('heading_path'),
+                'heading_path': payload.get('heading'),
                 'block_types': payload.get('block_types'),
                 'content': payload.get('text', ''),
                 'md5': payload.get('md5'),  # for rerank cache
@@ -548,6 +555,180 @@ def hybrid_search(query: str, top_k_dense: int = 20, top_k_sparse: int = 20, fin
         } for c in final
     ]
 # ---------------- End Sparse / Hybrid Retrieval Helpers ---------------- #
+
+# ---------------- Context Assembly & Generation Engine (Added) ---------------- #
+# Lightweight in-file implementations to fix NameError for assemble_context & generate_answer_engine
+# If later modularizing, these can be moved to a dedicated module.
+
+from typing import Tuple  # ensure Tuple available
+import re, time
+try:
+    import requests  # for Ollama calls
+except Exception:
+    requests = None  # type: ignore
+
+# In-memory conversation history (session_id -> list of {question, answer})
+_conversation_histories: Dict[str, List[dict]] = {}
+_MAX_HISTORY = 8  # keep last N turns
+
+def assemble_context(question: str, raw_docs: List[dict], max_tokens: int = 1800) -> List[dict]:
+    """Assemble a trimmed context list respecting a rough token budget.
+    Currently uses a simple word-count approximation (1 word ~ 1 token for short English).
+    Preserves original ordering from retrieval. Assigns provisional citation ids later in generation.
+    """
+    approx_tokens = 0
+    context: List[dict] = []
+    for d in raw_docs:
+        text = d.get('content') or d.get('text') or ''
+        # Trim excessively long chunks to avoid blowing the budget
+        if len(text) > 1200:
+            text = text[:1200]
+        token_est = len(text.split())
+        if context and approx_tokens + token_est > max_tokens:
+            break
+        nd = dict(d)  # shallow copy
+        nd['content'] = text
+        context.append(nd)
+        approx_tokens += token_est
+    return context
+
+def prompt_builder(question: str, context_docs: List[dict], chat_summary: Optional[str] = None, mode: str = "tutor", history: Optional[List[dict]] = None) -> str:
+    system_prompt = {
+        "tutor": "You are a knowledgeable tutor and academic guide. Use the provided context and, when helpful, your broader knowledge to teach clearly. Provide concise explanations, step-by-step reasoning, and encourage learning.",
+        "citations": "You are an academic assistant. Use ONLY the provided context. Cite facts with [C1], [C2], etc. Include a References section.",
+        "concise": "You are a helpful assistant. Answer concisely using the provided context."
+    }.get(mode, "You are a helpful assistant.")
+    parts = [system_prompt]
+    if chat_summary:
+        parts.append(f"Chat summary: {chat_summary}")
+    if history:
+        for h in history[-3:]:
+            parts.append(f"Prev Q: {h.get('question','')[:140]}\nA: {h.get('answer','')[:200]}")
+    ctx_lines = []
+    for i, d in enumerate(context_docs, start=1):
+        snippet = (d.get('content','') or '')[:300].strip()
+        ctx_lines.append(f"[C{i}] Source: {d.get('filename')} page {d.get('page')} chunk {d.get('chunk_index')}\n{snippet}")
+    parts.append("Question: " + question)
+    parts.append("Context:\n" + "\n\n".join(ctx_lines))
+    parts.append("Answer:")
+    return "\n\n".join(parts)
+
+def postprocess_answer(answer: str, context_docs: List[dict], min_words: int = 20, max_words: int = 320) -> str:
+    # Normalize citation markers to [C#]
+    answer = re.sub(r"\[C\s*(\d+)\]", r"[C\1]", answer)
+    answer = re.sub(r"\(C(\d+)\)", r"[C\1]", answer)
+    valid = {str(i+1) for i in range(len(context_docs))}
+    answer = re.sub(r"\[C(\d+)\]", lambda m: m.group(0) if m.group(1) in valid else "", answer)
+    words = answer.split()
+    if len(words) < min_words:
+        answer += "\n\n(Expand briefly; add one clarifying sentence with citations.)"
+    elif len(words) > max_words:
+        answer = " ".join(words[:max_words]) + "..."
+    if "References" not in answer and context_docs:
+        refs = "\nReferences:\n" + "\n".join([f"[C{i+1}] {d.get('filename')} page {d.get('page')}" for i, d in enumerate(context_docs[:3])])
+        answer += refs
+    return answer
+
+def _detect_topic_shift(history: List[dict], new_question: str) -> bool:
+    if not history:
+        return True
+    last_q = history[-1].get('question','')
+    if not last_q:
+        return True
+    q_tokens = set(new_question.lower().split())
+    last_tokens = set(last_q.lower().split())
+    if not last_tokens:
+        return True
+    overlap = len(q_tokens & last_tokens) / max(1, len(q_tokens | last_tokens))
+    return overlap < 0.25  # heuristic threshold
+
+def generate_answer_engine(question: str, context_docs: List[dict], chat_summary: Optional[str] = None, session_id: Optional[str] = None, mode: str = "tutor") -> Tuple[str, List[dict], Dict[str, Any]]:
+    """Unified answer generation + metadata.
+    Returns (answer, citations, meta) where meta includes topic_shift & history_used.
+    """
+    # Assign citation ids
+    for idx, d in enumerate(context_docs, start=1):
+        d['citation_id'] = idx
+    history = _conversation_histories.get(session_id, []) if session_id else []
+    topic_shift = _detect_topic_shift(history, question)
+    history_used = bool(history)
+    prompt = prompt_builder(question, context_docs, chat_summary, mode, history if history_used else None)
+
+    # Call model (Ollama) with retries
+    answer = ""
+    retries = 3
+    initial_timeout = 80
+    min_timeout = 25
+    timeout_reduction = 0.7
+    timeout_count = 0
+    if requests is None:
+        answer = "Error: requests library unavailable to contact model."
+    else:
+        for attempt in range(retries + 1):
+            current_timeout = max(min_timeout, initial_timeout * (timeout_reduction ** attempt))
+            try:
+                resp = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": os.environ.get('OLLAMA_MODEL','llama3:latest'),
+                        "prompt": prompt,
+                        "stream": False,
+                        "temperature": 0.7
+                    },
+                    timeout=current_timeout
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                answer = data.get('response','').strip()
+                if not answer and attempt < retries:
+                    timeout_count += 1
+                    time.sleep(2 * (attempt+1))
+                    continue
+                if not answer:
+                    answer = "Error: Empty response from model."
+                break
+            except requests.exceptions.Timeout:
+                timeout_count += 1
+                if attempt == retries:
+                    answer = f"Error: Model timeout after {retries+1} attempts."
+                else:
+                    time.sleep(2 * (attempt+1))
+            except requests.exceptions.ConnectionError:
+                if attempt == retries:
+                    answer = "Error: Cannot connect to model server (Ollama)."
+                else:
+                    time.sleep(3 * (attempt+1))
+            except Exception as e:
+                if attempt == retries:
+                    answer = f"Error: Model request failed: {e}"[:400]
+                else:
+                    time.sleep(2 * (attempt+1))
+                    timeout_count += 1
+    answer = postprocess_answer(answer, context_docs)
+    citations = [
+        {
+            'id': d['citation_id'],
+            'filename': d.get('filename'),
+            'page': d.get('page'),
+            'chunk_index': d.get('chunk_index')
+        }
+        for d in context_docs[: max(3, min(len(context_docs), 6) - timeout_count)]
+    ]
+    # Update history
+    if session_id:
+        hist = _conversation_histories.setdefault(session_id, [])
+        hist.append({'question': question, 'answer': answer[:800]})
+        if len(hist) > _MAX_HISTORY:
+            del hist[0: len(hist) - _MAX_HISTORY]
+    meta = {
+        'topic_shift': topic_shift,
+        'history_used': history_used,
+        'retries': retries,
+        'timeout_count': timeout_count,
+        'context_docs': len(context_docs)
+    }
+    return answer, citations, meta
+# ---------------- End Context Assembly & Generation Engine (Added) ---------------- #
 
 # Instantiate app here after helper definitions (lifespan previously defined above)
 app = FastAPI(lifespan=lifespan)
@@ -659,6 +840,7 @@ except Exception as e:
 # ---- New chunking helpers ----
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 150
+EMBEDDING_BATCH_SIZE = int(os.environ.get('EMBEDDING_BATCH_SIZE', '32'))  # NEW: used in batch embedding
 # Phase 1 additions
 SCHEMA_VERSION = int(os.environ.get("SCHEMA_VERSION", "3"))  # Bumped schema version for per-page + patterns + normalization
 ENABLE_PYMUPDF = os.environ.get("ENABLE_PYMUPDF", "1") == "1"
@@ -1083,9 +1265,19 @@ def load_documents():
             new_chunk_md5s: List[str] = []
             if embedder is not None and qdrant_client is not None and chunk_list_to_embed:
                 points = []
-                for ch in chunk_list_to_embed:
+                # NEW: batch embedding for efficiency
+                try:
+                    texts_to_embed = [ch["text"] for ch in chunk_list_to_embed]
+                    embeddings = embedder.encode(texts_to_embed, batch_size=EMBEDDING_BATCH_SIZE).tolist() if embedder is not None else []
+                except Exception as be:
+                    print(f"[WARNING] Batch embedding failed, falling back to per-chunk: {be}")
+                    embeddings = None
+                for idx_ch, ch in enumerate(chunk_list_to_embed):
                     try:
-                        embedding = embedder.encode(ch["text"]).tolist()
+                        if embeddings is not None:
+                            embedding = embeddings[idx_ch]
+                        else:
+                            embedding = embedder.encode(ch["text"]).tolist()
                         base_pages = ch.get('pages') or [ch.get('page')]
                         pages_key = ','.join(str(p) for p in base_pages)
                         chunk_uuid_seed = f"{fpath}#pages={pages_key}#chunk={ch['chunk_index']}#md5={ch['md5']}#schema={SCHEMA_VERSION}"
@@ -1105,16 +1297,12 @@ def load_documents():
                             payload['heading_path'] = ch['heading_path']
                         if 'block_types' in ch:
                             payload['block_types'] = ch['block_types']
-                        # Include table metadata if this chunk is a single table block
                         if 'block_types' in ch and len(ch['block_types']) == 1 and ch['block_types'][0] == 'table':
                             payload['table_markdown'] = ch['text'][:5000]
-                            # Attach summary if available
-                            # Attempt to parse summary from first line heuristic
                             if '\n' in ch['text']:
                                 first_line = ch['text'].split('\n',1)[0]
                                 if 'rows=' in first_line and 'cols=' in first_line:
                                     payload['table_summary'] = first_line[:300]
-                            # Propagate table metadata if available from block accumulation
                             if 'table_md5' in ch:
                                 payload['table_md5'] = ch['table_md5']
                             if 'table_csv' in ch:
@@ -1131,7 +1319,7 @@ def load_documents():
                     try:
                         qdrant_client.upsert(collection_name=QDRANT_COLLECTION, points=points)
                         action = "partially reindexed" if partial_reindex else "indexed"
-                        print(f"[INFO] {action} {len(points)} chunks for {rel} (schema {SCHEMA_VERSION})")
+                        print(f"[INFO] {action} {len(points)} chunks for {rel} (schema {SCHEMA_VERSION}) [batch]")
                     except Exception as up_err:
                         print(f"[ERROR] Upsert failed for {fpath}: {up_err}")
             elif embedder is None:
@@ -1260,8 +1448,13 @@ def generate_answer(question: str, context_docs: List[dict]) -> str:
         context_text = "\n\n".join([f"From {doc.get('filename','unknown')} (page {doc.get('page','?')}):\n{doc.get('content','')[:current_snippet_length]}..." 
                                 for doc in context_docs[:current_max_docs]])
         
-        # Streamlined prompt to reduce size
-        prompt = f"Answer the following question using ONLY the provided context. Be concise.\n\nQuestion: {question}\n\nContext:\n{context_text}"
+        # More conversational system prompt
+        system_prompt = (
+            "You are a knowledgeable tutor and academic guide. "
+            "Use the provided context and, when helpful, your broader knowledge to teach the student clearly. "
+            "Provide concise explanations, step-by-step reasoning, and encourage learning with follow-up questions."
+        )
+        prompt = f"{system_prompt}\n\nQuestion: {question}\n\nContext:\n{context_text}"
         
         # Calculate current timeout (reduce on each retry)
         current_timeout = max(min_timeout, initial_timeout * (timeout_reduction_factor ** attempt))
@@ -1444,778 +1637,70 @@ async def ask(request: Request):
     start_time = time.time()
     data = await request.json()
     question = data.get("question", "")
+    session_id = data.get("session_id")  # session id for history
     print(f"[DEBUG] Question received: '{question}'")
+    if session_id:
+        db = SessionLocal()
+        try:
+            cs = db.query(ChatSummary).filter(ChatSummary.session_id == session_id).first()
+            chat_summary_text = cs.summary_text if cs and cs.summary_text else ""
+        finally:
+            db.close()
+        print(f"[DEBUG] Chat summary for session {session_id}: {chat_summary_text}")
+    else:
+        chat_summary_text = ""
+
     if not question:
         print("[DEBUG] No question provided")
         return {"error": "Question is required"}
-    
-    # Try to initialize Qdrant client if not available
     if qdrant_client is None:
         _initialize_qdrant_client()
-    
-    # Determine search method
     use_hybrid = ENABLE_SPARSE and _SPARSE_OK and embedder is not None and qdrant_client is not None
-    
     try:
-        # Get context with caching - optimized parameters for better performance
         context_time_start = time.time()
         try:
-            # Use optimized parameters for context retrieval
             context_docs = get_context_for_question(question, use_hybrid)
         except Exception as context_error:
             print(f"[ERROR] Context retrieval failed: {context_error}")
-            # Fallback to simpler search method
             context_docs = simple_search(question, documents, top_k=5)
-            
         context_time = time.time() - context_time_start
         print(f"[TIMING] Context retrieval took {context_time:.2f}s")
-        
-        # Generate answer with improved error handling
+        if chat_summary_text:
+            context_docs.insert(0, {'filename': 'chat_summary', 'content': chat_summary_text, 'page': 0, 'chunk_index': 0})
+        # Unified generation
         answer_time_start = time.time()
-        try:
-            answer, citations = generate_answer_with_citations(question, context_docs)
-        except Exception as answer_error:
-            print(f"[ERROR] Answer generation failed: {answer_error}")
-            # Force fallback path
-            answer = f"Error: Failed to generate answer: {str(answer_error)}"
-            citations = []
-            
+        answer, citations, meta = generate_answer_engine(question, context_docs, chat_summary_text, session_id)
         answer_time = time.time() - answer_time_start
-        print(f"[TIMING] Answer generation took {answer_time:.2f}s")
-        
-        # Fallback if LLM call failed or timed out
-        if answer.lower().startswith("error"):  # Ollama error fallback
-            print("[WARNING] LLM generation failed, using extractive fallback response")
-            # Build extractive summary from top context
+        print(f"[TIMING] Answer generation took {answer_time:.2f}s (topic_shift={meta.get('topic_shift')}, history_used={meta.get('history_used')})")
+        if answer.lower().startswith("error"):
+            print("[WARNING] unified engine error fallback -> extractive summary")
             summary_lines = []
-            for d in context_docs[:4]:  # Use 4 docs for faster response
-                snippet = (d.get('content','') or '')[:120].strip().replace("\n", " ")  # 120 chars per snippet
-                summary_lines.append(f"- {d.get('filename')} (page {d.get('page')}): {snippet}...")
-            
-            # Extract error message for better user feedback
-            error_msg = answer.split("Error:", 1)[1].strip() if "Error:" in answer else "Unknown error"
-            error_msg = error_msg.split(".", 1)[0] + "." if "." in error_msg else error_msg
-            answer = f"I'm sorry, I couldn't generate an answer at this time ({error_msg}). Here are the relevant excerpts:\n" + "\n".join(summary_lines)
-        
-        # Prepare context snippets for frontend display - optimized to 6 docs
+            for d in context_docs[:4]:
+                snippet = (d.get('content','') or '')[:120].strip().replace("\n", " ")
+                summary_lines.append(f"- {d.get('filename')} (p{d.get('page')}): {snippet}...")
+            answer = answer + "\n\nRelevant excerpts:\n" + "\n".join(summary_lines)
         context_for_display = []
-        for doc in context_docs[:6]:  # 6 docs is a good balance
-            snippet = (doc.get('content','') or '')[:120].strip()  # 120 chars per snippet
+        for doc in context_docs[:6]:
+            snippet = (doc.get('content','') or '')[:120].strip()
             context_for_display.append({
                 "id": doc.get('citation_id', 0),
                 "filename": doc.get('filename', 'Unknown'),
                 "page": doc.get('page', 0),
                 "content": snippet
             })
-        
         total_time = time.time() - start_time
         print(f"[TIMING] Total processing took {total_time:.2f}s")
-        
         return {
             "answer": answer,
             "context": context_for_display,
             "documents_found": len(context_docs),
             "citations": citations,
-            "processing_time": round(total_time, 2)
-        }
-    except requests.exceptions.Timeout as e:
-        print(f"[ERROR] Timeout in /ask endpoint: {e}")
-        # Specific handling for timeout errors
-        try:
-            # Get fewer documents for extractive summary
-            context_docs = simple_search(question, documents, top_k=4)  # Use simple search as fallback
-            
-            # Create a simple extractive summary
-            summary = "I'm having trouble generating a complete answer due to a timeout. Here's relevant information:\n\n"
-            context_for_display = []
-            
-            for i, doc in enumerate(context_docs[:4], 1):
-                snippet = (doc.get('content', '') or '')[:120].strip()  # Shorter snippets
-                summary += f"[{i}] From {doc.get('filename', 'Unknown')} (page {doc.get('page', 0)}): {snippet}\n\n"
-                context_for_display.append({
-                    "id": i,
-                    "filename": doc.get('filename', 'Unknown'),
-                    "page": doc.get('page', 0),
-                    "content": snippet
-                })
-            
-            return {
-                "answer": summary,
-                "context": context_for_display,
-                "documents_found": len(context_docs),
-                "citations": [],
-                "error": "The request to Ollama timed out. Try asking a simpler question or check if Ollama is running properly.",
-                "processing_time": round(time.time() - start_time, 2)
-            }
-        except Exception as fallback_error:
-            return {
-                "answer": "Error: Request to Ollama timed out. I couldn't generate a fallback response either. Please try again with a simpler question.",
-                "context": [],
-                "documents_found": 0,
-                "citations": [],
-                "error": f"Timeout: {str(e)}. Fallback error: {str(fallback_error)}",
-                "processing_time": round(time.time() - start_time, 2)
-            }
-    except requests.exceptions.ConnectionError as e:
-        print(f"[ERROR] Connection error in /ask endpoint: {e}")
-        return {
-            "answer": "Error: Could not connect to Ollama. Please check if Ollama is running and restart if necessary.",
-            "context": [],
-            "documents_found": 0,
-            "citations": [],
-            "error": "Connection error: Cannot connect to Ollama. Please check if Ollama is running and restart if necessary.",
-            "processing_time": round(time.time() - start_time, 2)
+            "processing_time": round(total_time, 2),
+            "meta": meta
         }
     except Exception as e:
-        print(f"[ERROR] Error processing question: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        try:
-            # Get fewer documents for extractive summary using simple search
-            context_docs = simple_search(question, documents, top_k=4)  # Use simple search as fallback
-            
-            # Create a simple extractive summary
-            summary = "I encountered an error while processing your question, but here's relevant information:\n\n"
-            context_for_display = []
-            
-            for i, doc in enumerate(context_docs[:4], 1):
-                snippet = (doc.get('content', '') or '')[:120].strip()  # Shorter snippets
-                summary += f"[{i}] From {doc.get('filename', 'Unknown')} (page {doc.get('page', 0)}): {snippet}\n\n"
-                context_for_display.append({
-                    "id": i,
-                    "filename": doc.get('filename', 'Unknown'),
-                    "page": doc.get('page', 0),
-                    "content": snippet
-                })
-            
-            return {
-                "answer": summary,
-                "context": context_for_display,
-                "documents_found": len(context_docs),
-                "citations": [],
-                "error": f"Error processing your question: {str(e)}",
-                "processing_time": round(time.time() - start_time, 2)
-            }
-        except Exception as fallback_error:
-            return {
-                "error": f"Error processing your question: {str(e)}. Fallback error: {str(fallback_error)}",
-                "answer": "I encountered an error while processing your question. Please try again with a simpler question or check if Ollama is running properly.",
-                "context": [],
-                "documents_found": 0,
-                "citations": [],
-                "processing_time": round(time.time() - start_time, 2)
-            }
-
-@app.get('/search')
-def search(q: str, k_dense: int = 10, k_sparse: int = 10, k_final: int = 10, sparse_method: Optional[str] = None):
-    global SPARSE_METHOD
-    if sparse_method:
-        sm = sparse_method.lower()
-        if sm in ('bm25','tfidf') and sm != SPARSE_METHOD:
-            print(f"[INFO] Requested sparse_method={sm} differs from active={SPARSE_METHOD}; rebuilding on-the-fly")
-            SPARSE_METHOD = sm
-            _build_sparse_index()
-    if not q:
-        return {"error": "q required"}
-    dense_hits = _dense_search_internal(q, k_dense)
-    sparse_hits = _sparse_search(q, k_sparse)
-    fused = _rrf_fuse(dense_hits, sparse_hits, k_final*3) if (dense_hits or sparse_hits) else []
-    return {
-        'query': q,
-        'sparse_method': SPARSE_METHOD,
-        'dense': dense_hits[:k_final],
-        'sparse': sparse_hits[:k_final],
-        'fused': fused[:k_final]
-    }
-
-@app.get("/doc_stats")
-def doc_stats():
-    """Return filename and content length for all loaded documents."""
-    return {
-        "count": len(documents),
-        "docs": [
-            {"filename": d["filename"], "length": len(d["content"]) } for d in documents
-        ]
-    }
-
-@app.get("/doc")
-def get_doc(filename: str):
-    """Return a snippet of a specific document by its relative filename."""
-    for doc in documents:
-        if doc["filename"] == filename:
-            return {"filename": doc["filename"], "content": doc["content"][:500]}
-    return {"error": "Document not found"}
-
-
-@app.get("/ingest_status")
-def ingest_status():
-    return {
-        "total": ingest_total_files,
-        "processed": ingest_processed_files,
-        "skipped": ingest_skipped_files,
-        "removed": ingest_removed_files,
-        "pages_reindexed": ingest_pages_reindexed,
-        "percent": int(100 * ingest_processed_files / ingest_total_files) if ingest_total_files else 100
-    }
-
-@app.get("/ingest_metrics")
-def ingest_metrics():
-    """Aggregate ingestion metrics from manifest."""
-    manifest = _load_manifest()
-    files = manifest.get('files', {})
-    total_files = len(files)
-    total_chunks = sum(f.get('num_chunks', 0) for f in files.values())
-    total_tables = sum(f.get('counts', {}).get('tables', 0) for f in files.values())
-    total_equations = sum(f.get('counts', {}).get('equations', 0) for f in files.values())
-    total_figures = sum(f.get('counts', {}).get('figures', 0) for f in files.values())
-    total_chars = sum(f.get('counts', {}).get('chars', 0) for f in files.values())
-    ocr_pages = sum(f.get('counts', {}).get('ocr_pages', 0) for f in files.values())
-    return {
-        "files": total_files,
-        "chunks": total_chunks,
-        "tables": total_tables,
-        "equations": total_equations,
-        "figures": total_figures,
-        "chars": total_chars,
-        "ocr_pages": ocr_pages,
-        "avg_chunks_per_file": (total_chunks/total_files) if total_files else 0,
-        "avg_chars_per_file": (total_chars/total_files) if total_files else 0
-    }
-
-@app.get("/doc_structure")
-def doc_structure(filename: str):
-    """Return headings (heading_path values) and table summaries for a file from vector store payloads."""
-    if embedder is None or qdrant_client is None:
-        return {"error": "Vector store unavailable"}
-    try:
-        # Query all points for filename (limit large to safeguard)
-        # Use scroll API via filter
-        filter_condition = qdrant_models.Filter(must=[qdrant_models.FieldCondition(key="filename", match=qdrant_models.MatchValue(value=filename))])
-        headings: Set[str] = set()
-        tables: List[Dict[str, Any]] = []
-        offset = None
-        batch_limit = 256
-        while True:
-            scroll_res = qdrant_client.scroll(collection_name=QDRANT_COLLECTION, scroll_filter=filter_condition, limit=batch_limit, with_payload=True, offset=offset)
-            points, offset = scroll_res
-            if not points:
-                break
-            for pt in points:
-                payload = pt.payload or {}
-                hp = payload.get('heading_path')
-                if hp:
-                    headings.add(hp)
-                if 'table_markdown' in payload:
-                    tables.append({
-                        'page': payload.get('page'),
-                        'chunk_index': payload.get('chunk_index'),
-                        'preview': (payload.get('table_markdown') or '')[:400]
-                    })
-            if offset is None:
-                break
-        return {
-            'filename': filename,
-            'headings': sorted(headings),
-            'tables': tables,
-            'table_count': len(tables)
-        }
-    except Exception as e:
+        print(f"[ERROR] /ask endpoint failure: {e}")
         return {"error": str(e)}
-
-
-# Endpoint to reindex a single file (force re-embed)
-@app.post("/reindex_file")
-def reindex_file(filename: str):
-    """Force reindex a single file (relative to data dir)."""
-    target_path = os.path.join(DATA_DIR, filename)
-    if not os.path.isfile(target_path):
-        return {"error": "File not found"}
-    # Load manifest and wipe existing entry so load_documents reprocesses only that file
-    manifest = _load_manifest()
-    files = manifest.get('files', {})
-    if filename in files:
-        delete_file_points(filename)
-        files.pop(filename, None)
-        manifest['files'] = files
-        _save_manifest(manifest)
-    # Process only this file by temporarily limiting patterns
-    # Simplest: call load_documents (will process all). For large corpora implement targeted path logic.
-    load_documents()
-    return {"status": "reindexed", "file": filename}
-
-
-# Phase 1: structured PDF extraction with PyMuPDF
-
-def _structured_parse_pdf(fpath: str):
-    """Return structured representation if PyMuPDF available.
-    Returns dict with pages_blocks, page_texts, header/footer lines, per-page block counts, block md5s.
-    """
-    if not _PYMUPDF_AVAILABLE:
-        return None
-    try:
-        if fitz is None:
-            return None
-        doc = fitz.open(fpath)
-    except Exception as e:
-        print(f"[WARNING] PyMuPDF failed to open {fpath}: {e}")
-        return None
-    raw_pages_blocks = []
-    font_sizes = []
-    # Explicit index iteration to satisfy static analyzers (PyMuPDF Document is iterable but some type checkers flag it)
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        try:
-            page_dict = page.get_text("dict")  # type: ignore[attr-defined]
-            page_blocks = []
-            for blk in page_dict.get("blocks", []):
-                if 'lines' not in blk:
-                    continue
-                spans = []
-                for line in blk.get('lines', []):
-                    for span in line.get('spans', []):
-                        text = span.get('text', '').strip('\n')
-                        if text:
-                            spans.append((text, span.get('size', 0)))
-                if not spans:
-                    continue
-                text_join = ' '.join(s[0] for s in spans).strip()
-                text_join = normalize_block_text(text_join)
-                if not text_join:
-                    continue
-                avg_size = sum(s[1] for s in spans) / len(spans)
-                font_sizes.append(avg_size)
-                bbox = blk.get('bbox') if isinstance(blk, dict) else None
-                y_top = bbox[1] if bbox else None
-                x_left = bbox[0] if bbox else None  # new for refined ordering
-                page_blocks.append({
-                    'page': page_index + 1,
-                    'text': text_join,
-                    'font_size': avg_size,
-                    'type': 'paragraph',
-                    'heading_level': None,
-                    'y_top': y_top,
-                    'x_left': x_left
-                })
-            raw_pages_blocks.append(page_blocks)
-        except Exception as pe:
-            print(f"[WARNING] PyMuPDF parse error page {page_index+1} {fpath}: {pe}")
-            raw_pages_blocks.append([])
-    if not raw_pages_blocks:
-        return None
-    if not font_sizes:
-        return None
-    font_sizes_sorted = sorted(font_sizes)
-    median_size = font_sizes_sorted[len(font_sizes_sorted)//2]
-    heading_threshold = median_size * 1.15
-    for page_blocks in raw_pages_blocks:
-        for blk in page_blocks:
-            if blk['font_size'] >= heading_threshold and len(blk['text']) < 120:
-                blk['type'] = 'heading'
-                ratio = blk['font_size'] / median_size if median_size else 1.0
-                if ratio > 1.6:
-                    blk['heading_level'] = 1
-                elif ratio > 1.4:
-                    blk['heading_level'] = 2
-                elif ratio > 1.25:
-                    blk['heading_level'] = 3
-                else:
-                    blk['heading_level'] = 4
-    # --- Basic table extraction (Phase 2) ---
-    tables_per_page = [[] for _ in range(len(raw_pages_blocks))]
-    tables_count = 0
-    if ENABLE_TABLES:
-        try:
-            with pdfplumber.open(fpath) as pdf_tbl:
-                for p_idx in range(min(len(pdf_tbl.pages), len(raw_pages_blocks))):
-                    try:
-                        page_obj = pdf_tbl.pages[p_idx]
-                        # Use find_tables for bbox ordering
-                        found_tables = page_obj.find_tables() or []
-                        page_table_objs = []
-                        for tbl in found_tables:
-                            try:
-                                rows = [[(cell or '').strip() for cell in row] for row in tbl.extract()]  # type: ignore[attr-defined]
-                            except Exception:
-                                continue
-                            if not rows or not any(any(cell for cell in r) for r in rows):
-                                continue
-                            n_cols = max(len(r) for r in rows)
-                            for r in rows:
-                                while len(r) < n_cols:
-                                    r.append('')
-                            # Summarize/truncate
-                            disp_rows = rows[:TABLE_SUMMARY_MAX_ROWS]
-                            truncated = len(rows) > TABLE_SUMMARY_MAX_ROWS
-                            if truncated:
-                                disp_rows.append(['…'] * n_cols)
-                            if n_cols > TABLE_SUMMARY_MAX_COLS:
-                                for r in disp_rows:
-                                    del r[TABLE_SUMMARY_MAX_COLS:]
-                                if disp_rows and disp_rows[0]:
-                                    disp_rows[0][-1] = (disp_rows[0][-1] or '') + '…'
-                            header = disp_rows[0]
-                            md_lines = ['|' + '|'.join(c or ' ' for c in header) + '|']
-                            md_lines.append('|' + '|'.join(['---']*len(header)) + '|')
-                            for data_row in disp_rows[1:]:
-                                md_lines.append('|' + '|'.join(c or ' ' for c in data_row) + '|')
-                            table_markdown = '\n'.join(md_lines)
-                            table_md5 = hashlib.md5(table_markdown.encode('utf-8')).hexdigest()
-                            # Basic numeric column stats for summary
-                            col_stats = []
-                            for col_idx in range(n_cols):
-                                col_vals_raw = [r[col_idx] for r in rows[1:80] if len(r) > col_idx]
-                                numeric_vals = []
-                                for v in col_vals_raw:
-                                    try:
-                                        numeric_vals.append(float(v.replace('%','').replace(',','')))
-                                    except Exception:
-                                        continue
-                                if numeric_vals:
-                                    col_stats.append(f"c{col_idx+1}:n={len(numeric_vals)} min={min(numeric_vals):.2f} max={max(numeric_vals):.2f}")
-                            table_summary_stats = '; '.join(col_stats[:4]) if col_stats else ''
-                            table_summary = f"rows={len(rows)} cols={n_cols} {'truncated ' if truncated else ''}{table_summary_stats}".strip()
-                            y_top = tbl.bbox[1] if getattr(tbl, 'bbox', None) else 0  # type: ignore
-                            x_left = tbl.bbox[0] if getattr(tbl, 'bbox', None) else 0  # type: ignore
-                            # Build CSV (full rows) and cap later when storing in payload
-                            csv_lines = []
-                            for r in rows:
-                                # simple CSV quoting
-                                csv_cells = []
-                                for cell in r:
-                                    cell = cell or ''
-                                    if any(ch in cell for ch in [',','"','\n']):
-                                        cell = '"' + cell.replace('"','""') + '"'
-                                    csv_cells.append(cell)
-                                csv_lines.append(','.join(csv_cells))
-                            table_csv_full = '\n'.join(csv_lines)
-                            page_table_objs.append((y_top, x_left, {
-                                'page': p_idx + 1,
-                                'text': table_markdown,
-                                'font_size': 0,
-                                'type': 'table',
-                                'heading_level': None,
-                                'table_markdown': table_markdown,
-                                'n_rows': len(rows),
-                                'n_cols': n_cols,
-                                'table_md5': table_md5,
-                                'table_summary': table_summary,
-                                'table_csv': table_csv_full[:TABLE_CSV_MAX_CHARS],
-                                'y_top': y_top,
-                                'x_left': x_left
-                            }))
-                        if page_table_objs:
-                            text_blocks = raw_pages_blocks[p_idx]
-                            if any(b.get('y_top') is not None for b in text_blocks):
-                                combined = [
-                                    (
-                                        (b.get('y_top') if b.get('y_top') is not None else 9e9),
-                                        (b.get('x_left') if b.get('x_left') is not None else 9e9),
-                                        b
-                                    ) for b in text_blocks
-                                ]
-                                combined.extend(page_table_objs)  # already tuples (y_top,x_left,blk)
-                                combined.sort(key=lambda x: (x[0], x[1]))
-                                raw_pages_blocks[p_idx] = [b for _,__, b in combined]
-                            else:
-                                # Fallback: append at end preserving existing order
-                                for _,__, tbl_blk in page_table_objs:
-                                    raw_pages_blocks[p_idx].append(tbl_blk)
-                    except Exception as tpe:
-                        print(f"[WARNING] Table extraction failed on page {p_idx+1} {fpath}: {tpe}")
-        except Exception as te:
-            print(f"[INFO] pdfplumber table extraction unavailable for {fpath}: {te}")
-    # Merge table blocks at end of each page (simple strategy; future: preserve order via bbox)
-    for idx, page_blocks in enumerate(raw_pages_blocks):
-        if tables_per_page[idx]:
-            page_blocks.extend(tables_per_page[idx])
-    # --- End table extraction ---
-    num_pages = len(raw_pages_blocks)
-    first_counts: Dict[str,int] = {}
-    last_counts: Dict[str,int] = {}
-    for page_blocks in raw_pages_blocks:
-        if not page_blocks:
-            continue
-        first_line = page_blocks[0]['text'][:120].strip()
-        last_line = page_blocks[-1]['text'][:120].strip()
-        if first_line:
-            first_counts[first_line] = first_counts.get(first_line, 0) + 1
-        if last_line:
-            last_counts[last_line] = last_counts.get(last_line, 0) + 1
-    freq_cut = int(num_pages * HEADER_FOOTER_FREQ_THRESHOLD)
-    header_lines = {t for t,c in first_counts.items() if c >= freq_cut}
-    footer_lines = {t for t,c in last_counts.items() if c >= freq_cut}
-    cleaned_pages_blocks = []
-    for page_blocks in raw_pages_blocks:
-        new_blocks = []
-        for i, blk in enumerate(page_blocks):
-            txt120 = blk['text'][:120].strip()
-            if i == 0 and txt120 in header_lines:
-                continue
-            if i == len(page_blocks)-1 and txt120 in footer_lines:
-                continue
-            new_blocks.append(blk)
-        cleaned_pages_blocks.append(new_blocks)
-    page_texts = ['\n'.join(b['text'] for b in page_blocks) for page_blocks in cleaned_pages_blocks]
-    # Block md5s flattened (normalized already)
-    block_md5s: List[str] = []
-    per_page_counts: List[int] = []
-    for page_blocks in cleaned_pages_blocks:
-        per_page_counts.append(len(page_blocks))
-        for blk in page_blocks:
-            block_md5s.append(hashlib.md5(blk['text'].encode('utf-8')).hexdigest())
-    return {
-        'pages_blocks': cleaned_pages_blocks,
-        'page_texts': page_texts,
-        'header_lines': list(header_lines),
-        'footer_lines': list(footer_lines),
-        'per_page_num_blocks': per_page_counts,
-        'block_md5s': block_md5s,
-        'tables_count': tables_count
-    }
-
-
-def _structure_aware_chunk(pages_blocks):
-    """Chunk blocks respecting headings and token limits."""
-    chunks = []
-    heading_path = []
-    chunk_blocks_accum = []
-    chunk_tokens = 0
-    chunk_index_counter = 0
-    def flush():
-        nonlocal chunk_blocks_accum, chunk_tokens, chunk_index_counter
-        if not chunk_blocks_accum:
-            return
-        text = '\n'.join(b['text'] for b in chunk_blocks_accum)
-        md5 = hashlib.md5(text.encode('utf-8')).hexdigest()
-        # Table metadata propagation (single table block case)
-        tbl_blocks = [b for b in chunk_blocks_accum if b['type'] == 'table']
-        if len(tbl_blocks) == 1 and len(chunk_blocks_accum) == 1:
-            tbl = tbl_blocks[0]
-       
-
-        else:
-            tbl = None
-        pages = [b['page'] for b in chunk_blocks_accum]
-        block_types = [b['type'] for b in chunk_blocks_accum]
-        pages_sorted = sorted(set(pages))
-        chunk_entry = {
-            'page': min(pages_sorted),
-            'pages': pages_sorted,
-            'chunk_index': chunk_index_counter,
-            'text': text,
-            'md5': md5,
-            'heading_path': ' > '.join(heading_path),
-            'block_types': block_types,
-            'page_range': f"{min(pages_sorted)}-{max(pages_sorted)}" if len(pages_sorted)>1 else str(pages_sorted[0])
-        }
-        if tbl is not None:
-            # Carry table metadata
-            for k in ['table_md5','table_summary','table_csv','n_rows','n_cols']:
-                if k in tbl:
-                    chunk_entry[k] = tbl[k]
-        chunks.append(chunk_entry)
-        chunk_blocks_accum = []
-        chunk_tokens = 0
-        chunk_index_counter += 1
-    for page_blocks in pages_blocks:
-        for blk in page_blocks:
-            # Update heading path
-            if blk['type'] == 'heading':
-                # Flush current chunk before starting new section
-                flush()
-                # Trim heading path to level-1 + (level-1) items
-                level = blk.get('heading_level', 4) or 4
-                # Ensure heading_path list length >= level-1 then set
-                heading_path = heading_path[:level-1]
-                heading_path.append(blk['text'])
-                continue  # headings not embedded directly; or embed? choose skip to avoid duplication
-            # Merge short paragraphs logic: if last block short, combine naturally by not flushing
-            blk_tokens = len(blk['text'].split())
-            if chunk_tokens + blk_tokens > MAX_TOKENS or (chunk_tokens > 0 and chunk_tokens >= TARGET_TOKENS):
-                flush()
-            chunk_blocks_accum.append(blk)
-           
-            chunk_tokens += blk_tokens
-    flush()
-    return chunks
-
-# ---------------- Diversity-aware Context Assembly ---------------- #
-
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text.split()))
-
-def assemble_context(question: str, hits: List[dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> List[dict]:
-    if not ENABLE_DIVERSITY:
-        # simple return
-        return hits
-    # Identify if question wants tables
-    q_lower = question.lower()
-    wants_tables = any(k in q_lower for k in TABLE_KEYWORDS)
-    by_heading: Dict[str, List[dict]] = {}
-    for h in hits:
-        hp = h.get('heading_path') or ''
-        by_heading.setdefault(hp, []).append(h)
-    ordered_headings = sorted(by_heading.keys())
-    assembled: List[dict] = []
-    used_tokens = 0
-    # Round-robin pick per heading
-    while ordered_headings and used_tokens < max_tokens:
-        new_ordered = []
-        for hp in ordered_headings:
-            bucket = by_heading[hp]
-            if not bucket:
-                continue
-            cand = bucket.pop(0)
-            # Skip table-heavy chunks unless requested
-            block_types = cand.get('block_types') or []
-            if not wants_tables and block_types == ['table'] and len(assembled) >= 2:
-                # push to end for later
-                bucket.append(cand)
-            else:
-                tks = _estimate_tokens(cand.get('content',''))
-                if used_tokens + tks <= max_tokens:
-                    assembled.append(cand)
-                    used_tokens += tks
-            if bucket:
-                new_ordered.append(hp)
-        if new_ordered == ordered_headings:  # no progress
-            break
-        ordered_headings = new_ordered
-    return assembled
-# ---------------- End Diversity-aware Context Assembly ---------------- #
-
-# ---------------- New: Answer generation with citation markers ---------------- #
-
-def generate_answer_with_citations(question: str, context_docs: List[dict]) -> tuple[str, List[dict]]:
-    if not context_docs:
-        return ("I couldn't find relevant information to answer your question.", [])
-    
-    # Assign citation ids if not already
-    for idx, d in enumerate(context_docs, start=1):
-        d['citation_id'] = idx
-    
-    # Optimize context by limiting the number of documents and snippet length
-    # This reduces the prompt size and processing time
-    max_docs = min(len(context_docs), 6)  # Reduced from 8 to 6 most relevant documents
-    snippet_length = 250  # Initial snippet length, reduced from 300
-    
-    # Adaptive timeout and retry mechanism
-    max_retries = 3
-    initial_timeout = 90  # Initial timeout in seconds
-    min_timeout = 30  # Minimum timeout for subsequent retries
-    timeout_reduction_factor = 0.7  # Reduce timeout by 30% on each retry
-    
-    # Track timeouts to reduce context size on multiple timeouts
-    timeout_count = 0
-    
-    for attempt in range(max_retries + 1):
-        # Adjust context size if we've had multiple timeouts
-        current_max_docs = max(3, max_docs - timeout_count)  # Reduce docs but keep at least 3
-        current_snippet_length = max(150, snippet_length - (timeout_count * 50))  # Reduce snippet length but keep at least 150 chars
-        
-        # Build context with current parameters
-        context_lines = []
-        for d in context_docs[:current_max_docs]:
-            snippet = (d.get('content','') or '')[:current_snippet_length].strip()
-            context_lines.append(f"[C{d['citation_id']}] Source: {d.get('filename')} page {d.get('page')} chunk {d.get('chunk_index')}\n{snippet}")
-        
-        context_text = '\n\n'.join(context_lines)
-        
-        # Streamlined instructions to reduce prompt size
-        instructions = (
-            "You are an academic assistant. Use ONLY the provided context. "
-            "Cite facts with [C1], [C2], etc. Include References section at the end. Be concise."
-        )
-        
-        prompt = f"{instructions}\n\nQuestion: {question}\n\nContext:\n{context_text}\n\nAnswer:"
-        
-        # Calculate current timeout (reduce on each retry)
-        current_timeout = max(min_timeout, initial_timeout * (timeout_reduction_factor ** attempt))
-        
-        print(f"[INFO] Attempt {attempt+1}/{max_retries+1}: Using {current_max_docs} docs, {current_snippet_length} chars per snippet, {current_timeout:.1f}s timeout")
-        
-        try:
-            print(f"[INFO] Sending request to Ollama (attempt {attempt+1}/{max_retries+1})")
-            response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": "llama3:latest", 
-                    "prompt": prompt, 
-                    "stream": False,
-                    "temperature": 0.7
-                },
-                timeout=current_timeout
-            )
-            response.raise_for_status()
-            data = response.json()
-            answer = data.get('response', '')
-            
-            # Check for empty response
-            if not answer.strip():
-                print(f"[WARNING] Empty response received on attempt {attempt+1}")
-                if attempt < max_retries:
-                    timeout_count += 1  # Treat empty response like a timeout
-                    wait_time = (attempt + 1) * 2
-                    print(f"[INFO] Waiting {wait_time} seconds before retry...")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    return "Error: Received empty response from Ollama. Please try again with a simpler question.", []
-            
-            print(f"[INFO] Ollama response received successfully on attempt {attempt+1}")
-            break  # Success, exit retry loop
-            
-        except requests.exceptions.Timeout as e:
-            print(f"[WARNING] Timeout on attempt {attempt+1}/{max_retries+1}: {e}")
-            timeout_count += 1
-            
-            if attempt < max_retries:
-                # Wait before retrying, with increasing backoff
-                wait_time = (attempt + 1) * 2
-                print(f"[INFO] Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-            else:
-                answer = f"Error: Request to Ollama timed out after {max_retries+1} attempts. Try asking a simpler question or check if Ollama is running properly."
-                
-        except requests.exceptions.ConnectionError as e:
-            print(f"[ERROR] Connection error on attempt {attempt+1}: {e}")
-            if attempt < max_retries:
-                wait_time = (attempt + 1) * 3  # Longer wait for connection issues
-                print(f"[INFO] Connection issue - waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-            else:
-                answer = f"Error: Cannot connect to Ollama. Please check if Ollama is running and restart if necessary."
-                
-        except Exception as e:
-            print(f"[ERROR] Failed on attempt {attempt+1}/{max_retries+1}: {e}")
-            if attempt < max_retries:
-                wait_time = (attempt + 1) * 2
-                print(f"[INFO] Waiting {wait_time} seconds before retry due to error: {e}")
-                time.sleep(wait_time)
-                timeout_count += 1  # Reduce context on next attempt
-            else:
-                answer = f"Error communicating with Ollama: {str(e)}. Please try again or check if Ollama is running properly."
-                break
-    
-    # Extract error message if present for better user feedback
-    error_msg = None
-    if answer.lower().startswith("error:"):
-        parts = answer.split(".", 1)
-        if len(parts) > 1:
-            error_msg = parts[0].strip() + "."
-            answer = parts[1].strip()
-    
-    citations = [
-        {
-            'id': d['citation_id'],
-            'filename': d.get('filename'),
-            'page': d.get('page'),
-            'chunk_index': d.get('chunk_index')
-        } for d in context_docs[:current_max_docs]  # Only include citations for docs actually used
-    ]
-    
-    return answer, citations
-# ---------------- End: Answer generation with citation markers ---------------- #
 
 @app.get('/tables')
 def list_tables(filename: Optional[str] = None, limit: int = 200):
@@ -2302,6 +1787,130 @@ def get_table_csv(table_md5: Optional[str] = None, filename: Optional[str] = Non
         return {'error': 'Table not found'}
     except Exception as e:
         return {'error': str(e)}
+
+
+# Chat summary DB setup
+CHAT_DB_PATH = os.path.join(os.path.dirname(__file__), "chat_summary.db")
+engine = create_engine(f"sqlite:///{CHAT_DB_PATH}", connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+class ChatSummary(Base):
+    __tablename__ = "chat_summaries"
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    mood = Column(String)
+    motivation_level = Column(String)
+    understanding_level = Column(String)
+    summary_text = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+# Pydantic models for chat summary endpoint
+class ChatSummaryRequest(BaseModel):
+    session_id: str
+    messages: List[str]
+
+class ChatSummaryResponse(BaseModel):
+    mood: str
+    motivation_level: str
+    understanding_level: str
+    summary: str
+    
+
+@app.post("/chat_summary", response_model=ChatSummaryResponse)
+def create_chat_summary(request: ChatSummaryRequest):
+    """Create a new chat summary entry."""
+    db = SessionLocal()
+    try:
+        summary = ChatSummary(
+            session_id=request.session_id,
+            mood="",
+            motivation_level="",
+            understanding_level="",
+            summary_text=""
+        )
+        db.add(summary)
+        db.commit()
+        db.refresh(summary)
+        return summary
+    except Exception as e:
+        print(f"[ERROR] Failed to create chat summary: {e}")
+        return {"error": str(e)}
+    finally:
+        db.close()
+
+@app.get("/chat_summary")
+def read_chat_summaries(skip: int = 0, limit: int = 10):
+    """Retrieve chat summaries with pagination."""
+    db = SessionLocal()
+    try:
+        summaries = db.query(ChatSummary).offset(skip).limit(limit).all()
+        return summaries
+    except Exception as e:
+        print(f"[ERROR] Failed to read chat summaries: {e}")
+        return {"error": str(e)}
+    finally:
+        db.close()
+    
+
+@app.get("/chat_summary/{session_id}")
+def get_chat_summary(session_id: str):
+    """Get a specific chat summary by session ID."""
+    db = SessionLocal()
+    try:
+        summary = db.query(ChatSummary).filter(ChatSummary.session_id == session_id).first()
+        if summary:
+            return summary
+        else:
+            return {"error": "Summary not found"}
+    except Exception as e:
+        print(f"[ERROR] Failed to get chat summary: {e}")
+        return {"error": str(e)}
+    finally:
+        db.close()
+    
+
+@app.put("/chat_summary/{session_id}")
+def update_chat_summary(session_id: str, request: ChatSummaryRequest):
+    """Update an existing chat summary."""
+    db = SessionLocal()
+    try:
+        summary = db.query(ChatSummary).filter(ChatSummary.session_id == session_id)
+        if summary.first() is None:
+            return {"error": "Summary not found"}
+        summary.update({
+            "mood": request.mood,
+            "motivation_level": request.motivation_level,
+            "understanding_level": request.understanding_level,
+            "summary_text": request.summary
+        })
+        db.commit()
+        return {"status": "updated"}
+    except Exception as e:
+        print(f"[ERROR] Failed to update chat summary: {e}")
+        return {"error": str(e)}
+    finally:
+        db.close()
+    
+
+@app.delete("/chat_summary/{session_id}")
+def delete_chat_summary(session_id: str):
+    """Delete a chat summary."""
+    db = SessionLocal()
+    try:
+        result = db.query(ChatSummary).filter(ChatSummary.session_id == session_id).delete()
+        db.commit()
+        if result:
+            return {"status": "deleted"}
+        else:
+            return {"error": "Summary not found"}
+    except Exception as e:
+        print(f"[ERROR] Failed to delete chat summary: {e}")
+        return {"error": str(e)}
+    finally:
+        db.close()
 
 
 if __name__ == '__main__':

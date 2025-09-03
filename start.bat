@@ -39,14 +39,12 @@ if errorlevel 1 (
 
 REM Start FastAPI backend
 echo Starting backend server...
-cd backend
-start "Backend" cmd /k "cd /d %CD% && ..\venv\Scripts\activate.bat && python main.py"
-cd ..
+start "Backend" cmd /k cd /d "%~dp0backend" ^&^& call "%~dp0venv\Scripts\activate.bat" ^&^& python main.py
 
 REM Start React frontend
 echo Starting frontend...
-cd frontend
-start "Frontend" cmd /k "npm start"
+start "Frontend" cmd /k cd /d "%~dp0frontend" ^&^& npm start
+
 cd ..
 
 echo.

@@ -1,0 +1,5 @@
+Using Qdrant storage path: C:\HayStack\backend\qdrant_storage
+Attempting to load model from: C:\HayStack\models\all-MiniLM-L6-v2
+Path exists: True
+Path is absolute: True
+[INIT] Deferring model load to lifespan
