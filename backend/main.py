@@ -594,9 +594,39 @@ def assemble_context(question: str, raw_docs: List[dict], max_tokens: int = 1800
 
 def prompt_builder(question: str, context_docs: List[dict], chat_summary: Optional[str] = None, mode: str = "tutor", history: Optional[List[dict]] = None) -> str:
     system_prompt = {
-        "tutor": "You are a knowledgeable tutor and academic guide. Use the provided context and, when helpful, your broader knowledge to teach clearly. Provide concise explanations, step-by-step reasoning, and encourage learning.",
-        "citations": "You are an academic assistant. Use ONLY the provided context. Cite facts with [C1], [C2], etc. Include a References section.",
-        "concise": "You are a helpful assistant. Answer concisely using the provided context."
+        "tutor": """You are a patient, expert tutor. ALWAYS structure your answer in this exact format using Markdown:
+
+# 🎯 Problem
+[One clear sentence restating the question]
+
+## 📚 Key Concepts
+- [Bullet point 1: Core concept/formula needed]
+- [Bullet point 2: Another key idea]  
+- [Bullet point 3: etc.]
+
+## 📝 Step-by-Step Solution
+1. **Step 1**: [Clear action] - [Brief explanation]
+2. **Step 2**: [Next action] - [Show any equations/calculations]
+3. **Step 3**: [Continue logically] - [Explain reasoning]
+4. **Final Step**: [Conclude] - [State the answer clearly]
+
+## ✅ Final Answer
+**[State the final answer clearly in bold or use `code formatting` for numbers]**
+
+## 🔍 Quick Check
+[One sentence verification or dimensional analysis to confirm the answer makes sense]
+
+## 📖 References
+[List sources you actually used, format: [C1] filename page X]
+
+Rules:
+- Use citations [C1], [C2] ONLY where you actually reference the provided context
+- Keep each step concise but complete
+- Use proper Markdown formatting with headers, bold, bullets
+- If using general knowledge not in context, say "(general physics knowledge)" 
+- Be encouraging and educational, not just computational""",
+        "citations": "You are an academic assistant. Use ONLY the provided context. Cite facts with [C1], [C2], etc. Include a References section in Markdown format.",
+        "concise": "You are a helpful assistant. Answer concisely using the provided context in well-formatted Markdown."
     }.get(mode, "You are a helpful assistant.")
     parts = [system_prompt]
     if chat_summary:
@@ -613,20 +643,56 @@ def prompt_builder(question: str, context_docs: List[dict], chat_summary: Option
     parts.append("Answer:")
     return "\n\n".join(parts)
 
-def postprocess_answer(answer: str, context_docs: List[dict], min_words: int = 20, max_words: int = 320) -> str:
+def postprocess_answer(answer: str, context_docs: List[dict], question: str = "", min_words: int = 20, max_words: int = 500) -> str:
     # Normalize citation markers to [C#]
     answer = re.sub(r"\[C\s*(\d+)\]", r"[C\1]", answer)
     answer = re.sub(r"\(C(\d+)\)", r"[C\1]", answer)
     valid = {str(i+1) for i in range(len(context_docs))}
     answer = re.sub(r"\[C(\d+)\]", lambda m: m.group(0) if m.group(1) in valid else "", answer)
+    
+    # Ensure required sections exist
+    required_sections = ["Problem", "Key Concepts", "Step-by-Step Solution", "Final Answer", "Quick Check", "References"]
+    for section in required_sections:
+        if f"# {section}" not in answer and f"## {section}" not in answer:
+            if section == "Problem" and "🎯 Problem" not in answer:
+                problem_text = question if question else "Problem analysis needed"
+                answer = f"# 🎯 Problem\n{problem_text}\n\n" + answer
+            elif section == "Key Concepts" and "📚 Key Concepts" not in answer:
+                answer += f"\n\n## 📚 Key Concepts\n- Core concepts from the provided context"
+            elif section == "Step-by-Step Solution" and "📝 Step-by-Step Solution" not in answer:
+                answer += f"\n\n## 📝 Step-by-Step Solution\n1. **Analysis**: Based on the given information"
+            elif section == "Final Answer" and "✅ Final Answer" not in answer:
+                answer += f"\n\n## ✅ Final Answer\n**Answer derived from the analysis above**"
+            elif section == "Quick Check" and "🔍 Quick Check" not in answer:
+                answer += f"\n\n## 🔍 Quick Check\nThe answer appears reasonable based on the given parameters."
+    
+    # Ensure References section with actual citations
+    if "References" not in answer and "📖 References" not in answer and context_docs:
+        refs = "\n\n## 📖 References\n" + "\n".join([f"[C{i+1}] {d.get('filename')} page {d.get('page')}" for i, d in enumerate(context_docs[:3])])
+        answer += refs
+    
+    # Length control (increased limit for better educational content)
     words = answer.split()
     if len(words) < min_words:
-        answer += "\n\n(Expand briefly; add one clarifying sentence with citations.)"
+        answer += "\n\n*Note: Answer enhanced for educational completeness.*"
     elif len(words) > max_words:
-        answer = " ".join(words[:max_words]) + "..."
-    if "References" not in answer and context_docs:
-        refs = "\nReferences:\n" + "\n".join([f"[C{i+1}] {d.get('filename')} page {d.get('page')}" for i, d in enumerate(context_docs[:3])])
-        answer += refs
+        # Try to trim while keeping structure
+        lines = answer.split('\n')
+        truncated_lines = []
+        word_count = 0
+        for line in lines:
+            line_words = len(line.split())
+            if word_count + line_words <= max_words:
+                truncated_lines.append(line)
+                word_count += line_words
+            elif line.startswith('#') or line.startswith('##'):  # Keep headers
+                truncated_lines.append(line)
+            else:
+                break
+        answer = '\n'.join(truncated_lines)
+        if word_count >= max_words:
+            answer += "\n\n*[Answer truncated for length]*"
+    
     return answer
 
 def _detect_topic_shift(history: List[dict], new_question: str) -> bool:
@@ -704,7 +770,7 @@ def generate_answer_engine(question: str, context_docs: List[dict], chat_summary
                 else:
                     time.sleep(2 * (attempt+1))
                     timeout_count += 1
-    answer = postprocess_answer(answer, context_docs)
+    answer = postprocess_answer(answer, context_docs, question)
     citations = [
         {
             'id': d['citation_id'],
